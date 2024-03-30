@@ -140,15 +140,16 @@ impl<'d> embassy_usb_driver::Bus for Bus<'d> {
     }
 
     async fn enable(&mut self) {
-        trace!("enable");
-        // TODO: the comments in the embassy-stm32 crate indicate that the semantics
-        // of Bus::disable() aren't well defined yet.
+        trace!("bus enable");
+        // enable() is called after VBUS power is detected.
+        // We don't currently need to do anything in particular here, as we keep the data line
+        // pull-ups always enabled.
     }
 
     async fn disable(&mut self) {
         trace!("disable");
-        // TODO: the comments in the embassy-stm32 crate indicate that the semantics
-        // of Bus::disable() aren't well defined yet.
+        // disable() is called after VBUS power is lost.
+        // This only matters for self-powered devices :-)
     }
 
     async fn remote_wakeup(&mut self) -> Result<(), Unsupported> {

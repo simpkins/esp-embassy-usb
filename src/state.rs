@@ -44,6 +44,7 @@ pub(crate) struct State {
 
     config: Config,
     ep0_mps_bits: u8,
+    bus_event_flags: u8,
     initialized: bool,
 
     ep0_setup_data: [u32; 2],
@@ -92,6 +93,7 @@ impl State {
             usb0: unsafe { get_usb0_register_block() },
             config,
             ep0_mps_bits: 0,
+            bus_event_flags: 0,
             initialized: false,
             ep0_setup_data: [0; 2],
             ep0_setup_ready: false,
@@ -99,6 +101,60 @@ impl State {
             ep_out_waker: core::array::from_fn(|_| AtomicWaker::new()),
             ep_out_readers: core::array::from_fn(|_| ReadBuf::new()),
         }
+    }
+
+    /// The main USB worker function.
+    ///
+    /// This services any interrupts that have occurred.
+    ///
+    /// Currently we run this any time Bus::poll() is called, or any time a method is called on
+    /// endpoint 0 (either the IN or OUT sides).  In the future it would be nicer if there was a
+    /// separate embassy task that just ran a `State::run()` function which continually await'ed
+    /// a poll_fn() calling this in a loop.  For now we are relying on explicit knowledge of how
+    /// the higher-level UsbDevice::run() function works, and the fact that it should always either
+    /// be attempting to poll the bus or endpoint 0.
+    ///
+    /// See https://github.com/embassy-rs/embassy/issues/2751 for some discussion of this.
+    pub fn poll_usb(&mut self, cx: &mut core::task::Context) {
+        // Re-register to be woken again.
+        BUS_WAKER.register(cx.waker());
+        trace!("poll_usb starting");
+
+        // Call process_interrupts() to process interrupts from the gintsts register.
+        // This will clear each interrupt in gintsts as it processes them, so we won't get
+        // notified again about ones that have been processed.  It may return an event before
+        // processing all interrupts, in which case remaining ones will still be set in gintsts
+        // so the interrupt handler should fire again immediately to re-process these once we
+        // re-enable the interrupt mask below.
+        self.process_interrupts();
+
+        // Re-enable the interrupt mask
+        self.enable_intmask();
+    }
+
+    /// This performs the main logic for Bus::poll()
+    pub fn poll_bus(&mut self, cx: &mut core::task::Context) -> Poll<Event> {
+        self.poll_usb(cx);
+
+        if self.bus_event_flags == 0 {
+            // common case
+            return Poll::Pending;
+        }
+        // Multiple flags may be set, so just return the first one we find.
+        for (flag, event) in [
+            (bus_event_flag::POWER_DETECTED, Event::PowerDetected),
+            (bus_event_flag::POWER_REMOVED, Event::PowerRemoved),
+            (bus_event_flag::RESET, Event::Reset),
+            (bus_event_flag::SUSPEND, Event::Suspend),
+            (bus_event_flag::RESUME, Event::Resume),
+        ] {
+            if 0 != (self.bus_event_flags & flag) {
+                self.bus_event_flags &= !flag;
+                return Poll::Ready(event);
+            }
+        }
+        // We should only reach here if there is a bug.
+        Poll::Pending
     }
 
     pub fn set_ep0_max_packet_size(
@@ -283,6 +339,11 @@ impl State {
         cx: &mut core::task::Context,
         ep_index: usize,
     ) -> Poll<()> {
+        if ep_index == 0 {
+            // https://github.com/embassy-rs/embassy/issues/2751
+            self.poll_usb(cx);
+        }
+
         self.ep_out_waker[ep_index].register(cx.waker());
         let doepctl = self.usb0.out_ep(ep_index).doepctl().read();
         if doepctl.usbactep1().bit_is_set() {
@@ -298,6 +359,11 @@ impl State {
         ep_index: usize,
         buf: &mut [u8],
     ) -> Poll<Result<(), EndpointError>> {
+        if ep_index == 0 {
+            // https://github.com/embassy-rs/embassy/issues/2751
+            self.poll_usb(cx);
+        }
+
         self.ep_out_waker[ep_index].register(cx.waker());
 
         let out_ep = self.usb0.out_ep(ep_index);
@@ -352,6 +418,11 @@ impl State {
         cx: &mut core::task::Context,
         ep_index: usize,
     ) -> Poll<Result<usize, EndpointError>> {
+        if ep_index == 0 {
+            // https://github.com/embassy-rs/embassy/issues/2751
+            self.poll_usb(cx);
+        }
+
         trace!("OUT EP{} RX: polling for read complete", ep_index);
         self.ep_out_waker[ep_index].register(cx.waker());
 
@@ -386,6 +457,11 @@ impl State {
         cx: &mut core::task::Context,
         ep_index: usize,
     ) -> Poll<()> {
+        if ep_index == 0 {
+            // https://github.com/embassy-rs/embassy/issues/2751
+            self.poll_usb(cx);
+        }
+
         self.ep_in_waker[ep_index].register(cx.waker());
         let diepctl = self.usb0.in_ep(ep_index).diepctl().read();
         if diepctl.d_usbactep1().bit_is_set() {
@@ -409,6 +485,11 @@ impl State {
         fifo_index: usize,
         buf: &[u8],
     ) -> Poll<Result<(), EndpointError>> {
+        if ep_index == 0 {
+            // https://github.com/embassy-rs/embassy/issues/2751
+            self.poll_usb(cx);
+        }
+
         self.ep_in_waker[ep_index].register(cx.waker());
 
         let ep_regs = self.usb0.in_ep(ep_index);
@@ -472,25 +553,6 @@ impl State {
         Poll::Ready(Ok(()))
     }
 
-    pub fn poll_bus(&mut self, cx: &mut core::task::Context) -> Poll<Event> {
-        // Re-register to be woken again.
-        BUS_WAKER.register(cx.waker());
-        trace!("poll_bus starting");
-
-        // Call process_interrupts() to process interrupts from the gintsts register.
-        // This will clear each interrupt in gintsts as it processes them, so we won't get
-        // notified again about ones that have been processed.  It may return an event before
-        // processing all interrupts, in which case remaining ones will still be set in gintsts
-        // so the interrupt handler should fire again immediately to re-process these once we
-        // re-enable the interrupt mask below.
-        let result = self.process_interrupts();
-
-        // Re-enable the interrupt mask
-        self.enable_intmask();
-        trace!("USB poll returning {:?}", result);
-        result
-    }
-
     fn enable_intmask(&mut self) {
         self.usb0.gintmsk().write(|w| {
             w.modemismsk()
@@ -518,14 +580,26 @@ impl State {
         });
     }
 
-    fn process_interrupts(&mut self) -> Poll<Event> {
+    /// Record a bus event that has happened,
+    /// so we can return it the next time Bus::poll() is called.
+    fn record_bus_event(&mut self, event: Event) {
+        self.bus_event_flags |= match event {
+            Event::PowerDetected => bus_event_flag::POWER_DETECTED,
+            Event::PowerRemoved => bus_event_flag::POWER_REMOVED,
+            Event::Reset => bus_event_flag::RESET,
+            Event::Suspend => bus_event_flag::SUSPEND,
+            Event::Resume => bus_event_flag::RESUME,
+        };
+    }
+
+    fn process_interrupts(&mut self) {
         if !self.initialized {
             self.initialized = true;
 
             // If we don't have a dedicated pin to detect VBUS,
             // return a PowerDetected event immediately on startup.
             if let None = self.config.vbus_detection_pin {
-                return Poll::Ready(Event::PowerDetected);
+                self.record_bus_event(Event::PowerDetected);
             }
         }
 
@@ -541,7 +615,7 @@ impl State {
             trace!("vbus detected");
             self.usb0.gintsts().write(|w| w.sessreqint().set_bit());
             if self.config.vbus_detection_pin.is_some() {
-                return Poll::Ready(Event::PowerDetected);
+                self.record_bus_event(Event::PowerDetected);
             }
         }
 
@@ -573,7 +647,7 @@ impl State {
                 trace!("vbus removed");
                 if self.config.vbus_detection_pin.is_some() {
                     self.disable_all_endpoints();
-                    return Poll::Ready(Event::PowerRemoved);
+                    self.record_bus_event(Event::PowerRemoved);
                 }
             }
         }
@@ -593,19 +667,19 @@ impl State {
             trace!("USB enumeration done");
             self.usb0.gintsts().write(|w| w.enumdone().set_bit());
             self.process_enum_done();
-            return Poll::Ready(Event::Reset);
+            self.record_bus_event(Event::Reset);
         }
 
         if ints.usbsusp().bit() {
             trace!("USB suspend");
             self.usb0.gintsts().write(|w| w.usbsusp().set_bit());
-            return Poll::Ready(Event::Suspend);
+            self.record_bus_event(Event::Suspend);
         }
 
         if ints.wkupint().bit() {
             trace!("USB resume");
             self.usb0.gintsts().write(|w| w.wkupint().set_bit());
-            return Poll::Ready(Event::Resume);
+            self.record_bus_event(Event::Resume);
         }
 
         // I wonder if RXFLVI is a typo in the esp32s2/s3 SVD?  This is normally called RXFLVL.
@@ -625,8 +699,6 @@ impl State {
         if ints.iepint().bit() {
             self.process_in_ep_interrupts();
         }
-
-        Poll::Pending
     }
 
     fn process_reset(&mut self) {
@@ -1390,6 +1462,15 @@ mod pktsts {
     pub(crate) const _DATA_TOGGLE_ERROR: u8 = 5; // Host mode only
     pub(crate) const SETUP_RECEIVED: u8 = 6;
     pub(crate) const _CHANNEL_HALTED: u8 = 7; // Host mode only
+}
+
+// We could use the bitflags crate, but it didn't seem worth pulling in more dependencies.
+mod bus_event_flag {
+    pub(crate) const POWER_DETECTED: u8 = 0x01;
+    pub(crate) const POWER_REMOVED: u8 = 0x02;
+    pub(crate) const RESET: u8 = 0x04;
+    pub(crate) const SUSPEND: u8 = 0x08;
+    pub(crate) const RESUME: u8 = 0x10;
 }
 
 // Speed bits for use in the usb0.dcfg register.
