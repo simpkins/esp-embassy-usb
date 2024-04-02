@@ -40,6 +40,7 @@ embassy-usb = { version = "0.1.0", features = ["max-interface-count-1", "max-han
 esp-embassy-usb = { path = ".." }
 usbd-hid = "0.7.0"
 embedded-hal-async = "1.0.0"
+embassy-time = "0.3.0"
 
 [features]
 esp32s3 = ["esp-backtrace/esp32s3", "esp-hal/esp32s3", "esp-println/esp32s3", "esp-embassy-usb/esp32s3"]
