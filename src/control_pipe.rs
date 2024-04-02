@@ -30,7 +30,7 @@ impl<'d> ControlPipe<'d> {
 
 impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
     fn max_packet_size(&self) -> usize {
-        usize::from(self.max_packet_size)
+        self.max_packet_size as usize
     }
 
     async fn setup(&mut self) -> [u8; 8] {
@@ -43,15 +43,8 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
         _first: bool,
         _last: bool,
     ) -> Result<usize, EndpointError> {
-        // TODO: we probably shouldn't just call ep_out.read() here: if we somehow get out of sync
-        // with the host state (say due to a bug or a timeout), it may time out our transaction and
-        // try to start a new one with a SETUP packet.  If a SETUP packet arrives while we are
-        // waiting for ep_out.read() we should fail the operation and return an error.
-
-        // TODO
-        trace!("control: data_out");
+        trace!("EP0: data_out reading {} bytes", buf.len());
         let len = self.ep_out.read(buf).await?;
-        trace!("control: data_out read: {:?}", &buf[..len]);
         Ok(len)
     }
 
@@ -61,59 +54,39 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
         _first: bool,
         last: bool,
     ) -> Result<(), EndpointError> {
-        // TODO: as in data_out(), we should probably be prepared for a SETUP packet to arrive at
-        // any point, and fail the write attempt if we see a SETUP packet.
-        trace!("control: data_in write: {:?}", data);
+        trace!("EP0: data_in write: {:?}", data);
         self.ep_in.write(data).await?;
 
         // wait for status response from host after sending the last packet
         if last {
-            trace!("control: data_in waiting for status");
+            trace!("EP0: acknowledge IN");
             self.ep_out.read(&mut []).await?;
-            trace!("control: complete");
         }
 
         Ok(())
     }
 
     async fn accept(&mut self) {
-        trace!("control: accept");
-
+        trace!("EP0: accept");
         self.ep_in.write(&[]).await.ok();
-
-        trace!("control: accept OK");
     }
 
     async fn reject(&mut self) {
-        trace!("control: reject");
-
-        // TODO
-        /*
-        // EP0 should not be controlled by `Bus` so this RMW does not need a critical section
-        let regs = T::regs();
-        regs.diepctl(self.ep_in.info.addr.index()).modify(|w| {
-            w.set_stall(true);
-        });
-        regs.doepctl(self.ep_out.info.addr.index()).modify(|w| {
-            w.set_stall(true);
-        });
-        */
+        trace!("EP0: reject");
+        let state = self.state.borrow_mut();
+        state.stall_in_ep(0);
+        state.stall_out_ep(0);
     }
 
     async fn accept_set_address(&mut self, addr: u8) {
-        trace!("address set to: {:#x}", addr);
+        trace!("EP0: address set to: {:#x}", addr);
 
-        /*
-
-        // The Synopsys docs indicate we should update DCFG first, before triggering the STATUS IN
-        // response to the command (i.e., the accept() call).
-
-        // Note: we only modify self.usb0.dcfg() from the main USB executor, and never from
-        // interrupt context, so no critical section is needed here.
-        self.usb0.dcfg().modify(|_, w| w.devaddr().set_bits(addr));
-
-        // synopsys driver requires accept to be sent after changing address
+        // Note that the SETUP reply packet takes effect *after* the end of the SETUP transaction:
+        // the final "accept" packet should still contain the original address.  In other USB
+        // implementations you often have to send the IN reply packet first, before updating the
+        // address in hardware.  However, Synopsys USB cores handle the address transition, and
+        // they document that you should update the address before triggering the IN status packet.
+        self.state.borrow_mut().set_address(addr);
         self.accept().await
-        */
     }
 }

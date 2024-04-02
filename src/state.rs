@@ -175,6 +175,12 @@ impl State {
         Ok(())
     }
 
+    pub fn set_address(&mut self, address: u8) {
+        self.usb0
+            .dcfg()
+            .modify(|_, w| unsafe { w.devaddr().bits(address) });
+    }
+
     pub fn init_bus(&mut self, fifo_settings: &FifoSettings) {
         // Ensure the data line pull-up is disabled as we perform initialization.
         self.usb0.dctl().modify(|_, w| w.sftdiscon().set_bit());
@@ -429,6 +435,16 @@ impl State {
         if let Some(result) = self.ep_out_readers[ep_index].check_read_complete() {
             Poll::Ready(result)
         } else {
+            // If we are trying to read from endpoint 0 and we see a SETUP packet instead of an OUT
+            // packet, we should fail the read attempt.  This may happen if we get out of sync with
+            // the host somehow (e.g., due to a bug in our control transfer handling, or perhaps
+            // due to a buggy host).
+            if ep_index == 0 && self.ep0_setup_ready {
+                error!("received SETUP packet on EP0 while expecting an OUT packet");
+                // There unfortunately isn't a good EndpointError code for us to return here.
+                return Poll::Ready(Err(EndpointError::Disabled));
+            }
+
             Poll::Pending
         }
     }
@@ -544,6 +560,9 @@ impl State {
             w.d_xfersize1().bits(buf.len() as _)
         });
         // Now enable the endpoint to start writing, and clear the NAK bit.
+        //
+        // TODO: For isochronous endpoints I believe we need to manually set
+        // diepctl.setd0pid or diepctl.setd1pid.
         ep_regs
             .diepctl()
             .modify(|_, w| w.d_cnak1().set_bit().d_epena1().set_bit());
@@ -768,6 +787,8 @@ impl State {
                     .d_txfnum0()
                     .bits(EP0_TX_FIFO_NUM)
             }
+            .d_cnak0()
+            .set_bit()
             .d_stall0()
             .clear_bit()
         });
@@ -838,8 +859,9 @@ impl State {
                         self.ep0_setup_data[0] = rx_fifo.read();
                         self.ep0_setup_data[1] = rx_fifo.read();
                         trace!(
-                            "SETUP received: {:?}",
-                            bytemuck::cast_slice::<u32, u8>(&self.ep0_setup_data)
+                            "SETUP received: {:?} from rx_fifo address {:p}",
+                            bytemuck::cast_slice::<u32, u8>(&self.ep0_setup_data),
+                            rx_fifo
                         );
                     } else {
                         // We only ever configure EP0 as a control endpoint, so we don't expect to
@@ -900,32 +922,12 @@ impl State {
             //
             // TODO: it would perhaps be nice to have a separate buffer of max_packet_size
             // per OUT endpoint, so that we had a place to put this data, and could store it until
-            // the next read() call and return it then.
+            // the next read() call and return it then.  However, even then it seems tricky for
+            // callers to ensure that no data ever gets lost in the presence of timed out and
+            // dropped read operations.  It's not clear to me if it's worth trying to guarantee no
+            // data loss after a dropped read.
             self.discard_rx_fifo_data(byte_count);
         }
-
-        // TODO: look a bit more closely at the embassy-stm32 behavior, then delete this code.
-        /*
-        if state.ep_out_size[ep_num].load(Ordering::Acquire) == EP_OUT_BUFFER_EMPTY {
-            // SAFETY: Buffer size is allocated to be equal to endpoint's maximum packet size
-            // We trust the peripheral to not exceed its configured MPSIZ
-            let buf = unsafe {
-                core::slice::from_raw_parts_mut(*state.ep_out_buffers[ep_num].get(), len)
-            };
-
-
-            state.ep_out_size[ep_num].store(len as u16, Ordering::Release);
-            state.ep_out_wakers[ep_num].wake();
-        } else {
-            error!("ep_out buffer overflow index={}", ep_num);
-
-            // discard FIFO data
-            let len_words = (len + 3) / 4;
-            for _ in 0..len_words {
-                r.fifo(0).read().data();
-            }
-        }
-        */
     }
 
     fn discard_rx_fifo_data(&mut self, byte_count: u16) {
@@ -969,7 +971,6 @@ impl State {
         // point, so we could look at their implementation once that is complete.
         let fifo = self.usb0.fifo(fifo_index);
         let whole_words = buf.len() / 4;
-        // TODO: do testing of both code paths here
         if whole_words > 0 {
             // We could check buf.as_ptr().is_aligned_to(4), but this is nightly-only
             if ((buf.as_ptr() as usize) & 0x3) == 0 {
@@ -1077,6 +1078,11 @@ impl State {
             // - Modify grstctl to set txfnum to ep_index and set the txfflsh bit
             // - Wait for the txflsh bit to clear.
             // - Clear the NAK flag for the endpoint
+
+            // TODO: the ControlPipe task will presumably be waiting in endpoint.write() (to try
+            // and write another packet) or endpoint.read() (to read acknowledgement from the
+            // host).  We ideally should store some sort of flag somewhere to inform it that the
+            // control transfer has failed, so it can notice this when it polls when we wake it up.
         }
         if ints.d_xfercompl1().bit_is_set() {
             trace!("TX complete on EP{}", ep_index);
@@ -1089,13 +1095,15 @@ impl State {
     }
 
     fn disable_all_endpoints(&mut self) {
-        // TODO
-        /*
-        for i in 0..T::ENDPOINT_COUNT {
-            self.endpoint_set_enabled(EndpointAddress::from_parts(i, Direction::In), false);
-            self.endpoint_set_enabled(EndpointAddress::from_parts(i, Direction::Out), false);
+        self.flush_fifos_on_reset();
+
+        // TODO clear the usbactep flag in diepctl/doepctl for all endpoints
+        for _n in 1..NUM_IN_ENDPOINTS {
+            // TODO
         }
-        */
+        for _n in 1..NUM_OUT_ENDPOINTS {
+            // TODO
+        }
     }
 
     fn nak_all_out_endpoints(&mut self) {
@@ -1119,9 +1127,6 @@ impl State {
     fn stop_all_in_endpoints(&mut self) {
         trace!("stop_all_in_endpoints");
         // Set the disable and NAK bits
-        // Note: seems like an SVD typo that EP3 and EP5 use different register names?
-        //
-        // We do this for all endpoints except EP0, which is always enabled by hardware.
         self.usb0
             .in_ep0()
             .diepctl()
@@ -1169,8 +1174,6 @@ impl State {
         // reference manual.
 
         // 1. Enable all OUT endpoints
-        // TODO: should we perhaps also set the SNAK bit here, to ensure no new packets
-        // get put in the RX FIFO between when we flush it and when we set the global OUT NAK flag?
         self.usb0
             .out_ep0()
             .doepctl()
@@ -1184,6 +1187,9 @@ impl State {
 
         // 2. Flush the RX FIFO:
         // 2a. Wait for grstctl.ahbidle to be set
+        //
+        // (It seems a little surprising to me that the STMicro docs recommend flushing the RX FIFO
+        // before setting the global OUT NAK flag?)
         while self.usb0.grstctl().read().ahbidle().bit_is_clear() {}
 
         // 2b. Set grstctl.rxfflsh
@@ -1243,6 +1249,12 @@ impl State {
         // Read from the RX FIFO until we see the GLOBAL_OUT_NAK effective control word
         // TODO: create a helper function to process one RX FIFO entry, and then share that with
         // the normal process_rx_fifo() code?
+        //
+        // TODO: Actually, it would be better to just turn this function completely async.
+        // Rather than trying to do everything in poll_usb(), we could have Bus::poll() do some of
+        // the async handling work after it sees a Reset event.  We would need a small helper guard
+        // object to reference count how many people want global out nak mode enabled, so that if
+        // it is invoked multiple times we only turn it off when the last use goes away.
         loop {
             while self.usb0.gintsts().read().rxflvi().bit_is_clear() {}
             let ctrl_word = self.usb0.grxstsp().read();
@@ -1289,6 +1301,117 @@ impl State {
                 return false;
             }
         }
+    }
+
+    pub fn enable_in_ep(&mut self, ep_index: usize) {
+        /*{
+            critical_section::with(|_| {
+                // cancel transfer if active
+                if !enabled && r.diepctl(ep_addr.index()).read().epena() {
+                    r.diepctl(ep_addr.index()).modify(|w| {
+                        w.set_snak(true); // set NAK
+                        w.set_epdis(true);
+                    })
+                }
+
+                r.diepctl(ep_addr.index()).modify(|w| {
+                    w.set_usbaep(enabled);
+                    w.set_cnak(enabled); // clear NAK that might've been set by SNAK above.
+                })
+            });
+        }
+        */
+
+        // Wake the endpoint, in case some task is waiting in poll_in_ep_enabled()
+        self.ep_in_waker[ep_index].wake();
+    }
+
+    pub fn enable_out_ep(&mut self, ep_index: usize) {
+        // TODO
+        /*
+            critical_section::with(|_| {
+                // cancel transfer if active
+                if !enabled && r.doepctl(ep_addr.index()).read().epena() {
+                    r.doepctl(ep_addr.index()).modify(|w| {
+                        w.set_snak(true);
+                        w.set_epdis(true);
+                    })
+                }
+
+                r.doepctl(ep_addr.index()).modify(|w| {
+                    w.set_usbaep(enabled);
+                });
+
+                // Flush tx fifo
+                r.grstctl().write(|w| {
+                    w.set_txfflsh(true);
+                    w.set_txfnum(ep_addr.index() as _);
+                });
+                loop {
+                    let x = r.grstctl().read();
+                    if !x.txfflsh() {
+                        break;
+                    }
+                }
+            });
+        */
+
+        // Wake the endpoint, in case some task is waiting in poll_in_ep_enabled()
+        self.ep_out_waker[ep_index].wake();
+    }
+
+    pub fn disable_in_ep(&mut self, _ep_index: usize) {
+        // TODO
+    }
+
+    pub fn disable_out_ep(&mut self, _ep_index: usize) {
+        // The global OUT NAK flag must be set before disabling any OUT endpoint.
+        self.set_global_out_nak();
+
+        // TODO
+
+        // Exit global OUT NAK mode
+        self.usb0.dctl().modify(|_, w| w.cgoutnak().set_bit());
+    }
+
+    pub fn stall_in_ep(&self, ep_index: usize) {
+        self.usb0
+            .in_ep(ep_index)
+            .diepctl()
+            .modify(|_, w| w.d_stall1().set_bit());
+
+        // Note: the embassy-stm32 implementation wakes the endpoint waker here,
+        // but this doesn't seem necessary here to me?  I don't see any place where polling code
+        // would care about the stall flag changing.
+    }
+
+    pub fn stall_out_ep(&self, ep_index: usize) {
+        self.usb0
+            .out_ep(ep_index)
+            .doepctl()
+            .modify(|_, w| w.stall1().set_bit());
+
+        // Note: the embassy-stm32 implementation wakes the endpoint waker here,
+        // but this doesn't seem necessary here to me?  I don't see any place where polling code
+        // would care about the stall flag changing.
+    }
+
+    pub fn is_in_ep_stalled(&self, ep_index: usize) -> bool {
+        self.usb0
+            .in_ep(ep_index)
+            .diepctl()
+            .read()
+            .d_stall1()
+            .bit_is_set()
+    }
+
+    pub fn is_out_ep_stalled(&self, ep_index: usize) -> bool {
+        self.usb0
+            .out_ep(ep_index)
+            .doepctl()
+            .read()
+            .stall1()
+            .bit_is_set()
     }
 }
 
@@ -1413,7 +1536,6 @@ impl ReadBuf {
 
     fn read_complete(&mut self) {
         assert_eq!(self.status, ReadStatus::Pending);
-        self.status = ReadStatus::Complete;
         match self.status {
             ReadStatus::Pending => {
                 self.status = ReadStatus::Complete;
@@ -1428,6 +1550,7 @@ impl ReadBuf {
                 panic!("no pending read");
             }
         }
+        self.status = ReadStatus::Complete;
     }
 
     fn check_read_complete(&mut self) -> Option<Result<usize, EndpointError>> {
