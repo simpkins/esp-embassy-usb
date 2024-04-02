@@ -10,23 +10,12 @@ pub const NUM_IN_ENDPOINTS: usize = 7;
 pub const NUM_OUT_ENDPOINTS: usize = 7;
 
 // An alternate version of the esp_hal::peripherals::USB0 register block.
-// The one in the esp-pacs crate has some deficiencies:
+// The one in the esp-pacs crate has bugs.
 //
-// - The FIFO addresses are not exposed.
-// - For most of the endpoint registers, a separate type is used for each endpoint (e.g., doepint0,
-//   doepint1, doepint2, etc.)  This means that you have to write separate code for each endpoint.
-//   Even though you might be able to write generic functions that could accept any of the endpoint
-//   registers, this would still emit 6 separate copies of the function, one for each endpoint.
-// - There are bugs in some of the endpoint registers, such as incorrect bit widths on some fields,
-//   and fields incorrectly being marked read-only rather than read-write.
+// I'm working to submit PRs for some of these issues
+// https://github.com/embassy-rs/embassy/issues/2751
 //
-// I have submitted a few pull requests to esp-pacs to address some of these issues
-// (e.g., https://github.com/esp-rs/esp-pacs/pull/213), however it doesn't really fully address
-// everything and I'm not sure if they will get accepted.
-//
-// I haven't populated all of the fields right now, mainly just device-oriented registers I care
-// about.
-//
+// In the meantime, this is a bit of a hack to unblock my own local development
 // esp32s2 and esp32s3 both appear to use the same register layout for these fields.
 #[repr(C)]
 pub struct Usb0RegisterBlock {
@@ -70,13 +59,15 @@ pub struct Usb0RegisterBlock {
     _reserved09e0: [u8; 0x120],
     out_ep_reg: [OutEpRegisterBlock; NUM_IN_ENDPOINTS], // 0x0b00 to 0x0be0
     _reserved0be0: [u8; 0x420],
-    fifo: [FifoRegisterBlock; 16], // 0x0b00 to 0x0be0
+    fifo: [FifoRegisterBlock; 16], // 0x1000 to 0x2000
 }
 
 // Sanity check our layout
 const_assert_eq!(core::mem::offset_of!(Usb0RegisterBlock, hptxfsiz), 0x100);
 const_assert_eq!(core::mem::offset_of!(Usb0RegisterBlock, dcfg), 0x800);
 const_assert_eq!(core::mem::offset_of!(Usb0RegisterBlock, in_ep_reg), 0x900);
+const_assert_eq!(core::mem::offset_of!(Usb0RegisterBlock, out_ep_reg), 0xb00);
+const_assert_eq!(core::mem::offset_of!(Usb0RegisterBlock, fifo), 0x1000);
 
 #[repr(C)]
 pub struct InEpRegisterBlock {
@@ -128,18 +119,16 @@ pub struct OutEp0RegisterBlock {
 
 #[repr(C)]
 pub struct FifoRegisterBlock {
-    // Each FIFO has a 256 byte range, but each word in the range behaves the same.
-    // We only expose a single word.
-    word: vcell::VolatileCell<u32>,
-    _reserved: [u8; 252],
+    // Each word in FIFO the range behaves the same.
+    word: [vcell::VolatileCell<u32>; 1024],
 }
 
 impl FifoRegisterBlock {
     pub fn read(&self) -> u32 {
-        self.word.get()
+        self.word[0].get()
     }
     pub fn write(&self, value: u32) {
-        self.word.set(value)
+        self.word[0].set(value)
     }
 }
 
