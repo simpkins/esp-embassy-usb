@@ -337,6 +337,7 @@ impl State {
             "SETUP ready: {:?}",
             bytemuck::cast_slice::<u32, u8>(&self.ep0_setup_data)
         );
+        self.ep0_setup_ready = false;
         Poll::Ready(bytemuck::cast(self.ep0_setup_data))
     }
 
@@ -433,8 +434,20 @@ impl State {
         self.ep_out_waker[ep_index].register(cx.waker());
 
         if let Some(result) = self.ep_out_readers[ep_index].check_read_complete() {
-            Poll::Ready(result)
-        } else {
+            return Poll::Ready(result);
+        }
+
+        if ep_index == 0 {
+            // If the bus is reset while we are reading, endpoint 0 doesn't get disabled
+            // but we do set the OUT NAK flag for it.  Check to see if this has been disabled.
+            let out_ep = self.usb0.out_ep0();
+            let doepctl = out_ep.doepctl().read();
+            trace!("  EP0 doepctl: {:?}", doepctl);
+            if doepctl.naksts0().bit_is_set() {
+                warn!("bus reset while attempting to read from EP0");
+                return Poll::Ready(Err(EndpointError::Disabled));
+            }
+
             // If we are trying to read from endpoint 0 and we see a SETUP packet instead of an OUT
             // packet, we should fail the read attempt.  This may happen if we get out of sync with
             // the host somehow (e.g., due to a bug in our control transfer handling, or perhaps
@@ -444,9 +457,18 @@ impl State {
                 // There unfortunately isn't a good EndpointError code for us to return here.
                 return Poll::Ready(Err(EndpointError::Disabled));
             }
-
-            Poll::Pending
+        } else {
+            // If the endpoint is disabled, fail the read.
+            // This can happen if the bus is reset while we are attempting to read.
+            let out_ep = self.usb0.out_ep(ep_index);
+            let doepctl = out_ep.doepctl().read();
+            if doepctl.usbactep1().bit_is_clear() {
+                trace!("OUT EP{} RX: endpoint has been disabled", ep_index);
+                return Poll::Ready(Err(EndpointError::Disabled));
+            }
         }
+
+        Poll::Pending
     }
 
     fn read_operation_dropped(&mut self, ep_index: usize, buf: &mut [u8]) {
@@ -521,10 +543,10 @@ impl State {
 
         let dtxfsts = ep_regs.dtxfsts().read();
         trace!(
-            "IN EP{} poll write: diepctl {:08x} dtxfsts {:08x}",
+            "IN EP{} poll write: diepctl {:?} dtxfsts {:?}",
             ep_index,
-            diepctl.bits(),
-            dtxfsts.bits()
+            diepctl,
+            dtxfsts
         );
 
         // Check for available TX FIFO space.
@@ -566,6 +588,12 @@ impl State {
         ep_regs
             .diepctl()
             .modify(|_, w| w.d_cnak1().set_bit().d_epena1().set_bit());
+        trace!(
+            "writing to FIFO {} dieptsiz={:?} diepctl={:?}",
+            fifo_index,
+            ep_regs.dieptsiz(),
+            ep_regs.diepctl()
+        );
 
         // Finally write all data to the FIFO
         self.write_to_fifo(buf, fifo_index);
@@ -623,7 +651,20 @@ impl State {
         }
 
         let ints = self.usb0.gintsts().read();
-        trace!("USB poll bus: ints={:#x}", ints.bits());
+        trace!("USB poll bus: ints={:x} {:?}", ints.bits(), ints);
+
+        // Process RX FIFO events first, before bus reset events.
+        // When first connecting to a device, Linux hosts tend to request the device descriptor,
+        // then immediately reset the bus and reset the descriptor again after a reset.  On this
+        // first reset we often get the status acknowledgement of the device desctiptor response
+        // together with an interrupt resetting the bus.  Process the info from the RX FIFO first,
+        // just so we go through the normal SETUP transaction completion logic rather than first
+        // processing the reset and warn about the transaction being aborted partway through.
+        //
+        // I wonder if RXFLVI is a typo in the esp32s2/s3 SVD?  This is normally called RXFLVL.
+        if ints.rxflvi().bit() {
+            self.process_rx_fifo();
+        }
 
         if ints.modemis().bit() {
             error!("USB mode mismatch");
@@ -701,19 +742,12 @@ impl State {
             self.record_bus_event(Event::Resume);
         }
 
-        // I wonder if RXFLVI is a typo in the esp32s2/s3 SVD?  This is normally called RXFLVL.
-        if ints.rxflvi().bit() {
-            self.process_rx_fifo();
-        }
-
         // We don't currently register for OUT endpoint interrupts.
         // Maybe we will need to in the future if we wanted to fix the busy loop in
         // stop_all_out_endpoints(), and wait for the endpoint disable interrupt.
-        /*
         if ints.oepint().bit() {
             self.process_out_ep_interrupts();
         }
-        */
 
         if ints.iepint().bit() {
             self.process_in_ep_interrupts();
@@ -735,8 +769,13 @@ impl State {
 
         self.flush_fifos_on_reset();
 
-        // TODO: Reset all software endpoint state.  Do we need to do anything here, or will
-        // embassy-usb do this on the Reset event after the enumdone interrupt?
+        // Wake any endpoints that may have been waiting on transactions
+        for waker in &self.ep_in_waker {
+            waker.wake();
+        }
+        for waker in &self.ep_out_waker {
+            waker.wake();
+        }
 
         // Note: we don't change the FIFO configuration (grxfsiz, gnptxfsiz, dieptxf1, etc.)
         // This is set initially during Driver::start(), and embassy-usb doesn't allow changing
@@ -744,19 +783,12 @@ impl State {
 
         // Re-enable receipt of SETUP and XFER complete endpoint interrupts
 
-        // At the moment we don't care about any OUT endpoint interrupts,
-        // so we don't set daintmsk.outepmsk0 or doepmsk.setupmsk and doepmsk.xfercomplmsk
-        // Maybe xfercomplmsk would be useful purely for debug logging
-        // TODO: clean this up after I'm sure I don't need it anymore
-        /*
         self.usb0
             .daintmsk()
             .modify(|_, w| w.outepmsk0().set_bit().inepmsk0().set_bit());
         self.usb0
             .doepmsk()
             .modify(|_, w| w.setupmsk().set_bit().xfercomplmsk().set_bit());
-            */
-        self.usb0.daintmsk().modify(|_, w| w.inepmsk0().set_bit());
         self.usb0
             .diepmsk()
             .modify(|_, w| w.timeoutmsk().set_bit().di_xfercomplmsk().set_bit());
@@ -996,12 +1028,11 @@ impl State {
         }
     }
 
-    /*
     fn process_out_ep_interrupts(&mut self) {
-        let daint = (self.usb0.daint().read().bits() >> 16);
+        let daint = self.usb0.daint().read().bits() >> 16;
 
         for ep_index in 0..NUM_OUT_ENDPOINTS {
-            if daint & (1 << ep_index) {
+            if 0 != daint & (1 << ep_index) {
                 self.service_out_endpoint(ep_index);
             }
         }
@@ -1012,28 +1043,30 @@ impl State {
         let ints = doepint.read();
         trace!("interrupt on OUT EP{}: {:#x}", ep_index, ints.bits());
 
+        doepint.write(|w| {
+            w.setup1()
+                .set_bit()
+                .stuppktrcvd1()
+                .set_bit()
+                .xfercompl1()
+                .set_bit()
+        });
+
         if ints.stuppktrcvd1().bit() {
             trace!("process setup received");
+            // We don't do any work here, but we have to clear the interrupt bit
+            // so that the USB core will generate a SETUP done event for the next transaction
+            // following this one.
+            /*
             // We only configure EP0 as a control endpoint, so we don't expect to get SETUP packets
             // on any other endpoint, unless maybe the host is buggy?
             if ep_index == 0 {
                 self.ep0_setup_ready = true;
                 self.ep_out_waker[0].wake();
             }
+            */
         }
-
-        // TODO: actually process the interrupts
-        doepint.write(|w| {
-            w.setup1()
-                .set_bit()
-                .stuppktrcvd0()
-                .set_bit()
-                .xfercompl0()
-                .set_bit()
-        });
-        // TODO
     }
-    */
 
     fn process_in_ep_interrupts(&mut self) {
         let daint = self.usb0.daint().read().bits();
@@ -1059,6 +1092,7 @@ impl State {
         // any endpoint handling code that may be pending.  (In particular, poll_in_ep_transmit()
         // cares about this if it is pending.)
         if ints.d_txfemp1().bit_is_set() {
+            trace!("TX FIFO empty on EP{}", ep_index);
             self.usb0.diepempmsk().modify(|r, w| {
                 let new_bits = r.d_ineptxfempmsk().bits() & !(1 << ep_index);
                 unsafe { w.d_ineptxfempmsk().bits(new_bits) }
@@ -1207,14 +1241,11 @@ impl State {
         // 4. Confirm that the gnokeff bit is set in gintsts
         self.set_global_out_nak();
 
-        // 5. disable all OUT endpoints by setting epdis and snak in doepctlN
+        // 5. Stop reads on all OUT endpoints by setting epdis and snak in doepctlN
         //
         // Hmm, the esp32s3 SVD lists the EPDIS bits as readable but not writable.
         // The ESP32 tinyusb code does set them though.  Let's do the same.
         // This unfortunately means we need to manually set these bits.
-        //
-        // Note that we skip EP0, since it is always enabled by hardware.  (SETUP packets cannot be
-        // NAKed).
         const EPDIS: u32 = 1 << 30;
         const SNAK: u32 = 1 << 27;
         for n in 1..NUM_OUT_ENDPOINTS {
@@ -1223,6 +1254,11 @@ impl State {
                 .doepctl()
                 .modify(|r, w| unsafe { w.bits(r.bits() | EPDIS | SNAK) });
         }
+        // Endpoint 0 cannot be disabled, but set the NAK flag for it.
+        self.usb0
+            .out_ep0()
+            .doepctl()
+            .modify(|_, w| w.do_snak0().set_bit());
 
         // 6. wait for the epdis interrupt in doepintN for all endpoints
         for n in 1..NUM_OUT_ENDPOINTS {
