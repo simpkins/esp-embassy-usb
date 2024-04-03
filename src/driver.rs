@@ -1,18 +1,13 @@
 use crate::bus::Bus;
 use crate::control_pipe::ControlPipe;
 use crate::endpoint::{EndpointIn, EndpointOut};
-use crate::phy::init_phy;
 use crate::state::{InEndpointConfig, OutEndpointConfig, State};
-use crate::{Config, PhyType};
 use core::cell::RefCell;
 use embassy_usb_driver::{EndpointAllocError, EndpointType};
-use esp_hal::gpio::{DriveStrength, OutputPin};
-use esp_hal::peripheral::Peripheral;
-use esp_hal::peripherals;
 use log::{error, trace};
 
 pub struct Driver<'d> {
-    state: &'d RefCell<State>,
+    state: &'d RefCell<State<'d>>,
     fifo_settings: FifoSettings,
 }
 
@@ -131,57 +126,10 @@ impl FifoSettings {
 }
 
 impl<'d> Driver<'d> {
-    pub fn new<P, M>(
-        usb0: impl Peripheral<P = peripherals::USB0> + 'd,
-        usb_wrap: impl Peripheral<P = peripherals::USB_WRAP> + 'd,
-        rtc: &peripherals::LPWR,
-        mut dp: impl Peripheral<P = P> + 'd,
-        mut dm: impl Peripheral<P = M> + 'd,
-        config: Config,
-    ) -> Self
-    where
-        P: esp_hal::otg_fs::UsbDp + OutputPin + Send + Sync,
-        M: esp_hal::otg_fs::UsbDm + OutputPin + Send + Sync,
-    {
-        let mut usb0 = usb0.into_ref();
-        let usb_wrap = usb_wrap.into_ref();
-
-        if let PhyType::Internal = config.phy_type {
-            // The C ESP-IDF code sets the drive strength to the strongest level
-            // when using the internal PHY.
-            //
-            // We have to use clone_unchecked() here since the USB::new() call requires
-            // Peripheral objects, and does not accept PeripheralRef.  (This perhaps seems like an
-            // API design bug that it can't accept moved PeripheralRef objects?)
-            unsafe { dp.clone_unchecked() }.set_drive_strength(DriveStrength::I40mA);
-            unsafe { dm.clone_unchecked() }.set_drive_strength(DriveStrength::I40mA);
-        }
-
-        // Initialize the USB peripheral.
-        // Unfortunately PeripheralClockControl is private inside esp-hal, and the only way
-        // to initialize the peripheral is by calling esp_hal::otg_fs::USB::new() to create and
-        // then destroy a temporary USB object.
-        {
-            esp_hal::otg_fs::USB::new(&mut *usb0, dp, dm);
-        }
-
-        // It's a little unfortunate that we need to use global state.
-        // It would be nicer if the Driver::start() could return a state object to the user,
-        // so that the user could manage its lifetime rather only having separate Bus and
-        // ControlPipe objects that implicitly depend on the same shared state.
-        // The interrupt handler obviously requires some global state, but only needs minimal state
-        // (just a pointer to the waker).  We could automatically uninstall the interrupt handler
-        // when the main state was dropped if we had proper lifetime management of the main state.
-        let state = unsafe { crate::state::STATE.write(RefCell::new(State::new(config))) };
-
-        // Perform one-time initialization of the PHY and other registers.
-        // We do this here so that we only need a temporary reference to rtc.
-        //
-        // We really only need access to rtc.usb_conf(), but esp-hal doesn't really expose the type
-        // name for this variable without us needing to directly import the specific chip esp-pac
-        // crate.
-        init_phy(&config, &*usb_wrap, rtc);
-
+    /// Driver constructor.
+    /// Users shouldn't use this directly: use State::new() to create a State object instead,
+    /// then call State::driver().
+    pub(crate) fn new(state: &'d RefCell<State<'d>>) -> Self {
         Self {
             state,
             fifo_settings: FifoSettings::new(),

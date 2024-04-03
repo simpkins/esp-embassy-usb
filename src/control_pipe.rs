@@ -6,7 +6,7 @@ use futures::future::poll_fn;
 use log::trace;
 
 pub struct ControlPipe<'d> {
-    state: &'d RefCell<State>,
+    state: &'d RefCell<State<'d>>,  // TODO: remove this and access ep_in.state instead?
     max_packet_size: u16,
     ep_in: EndpointIn<'d>,
     ep_out: EndpointOut<'d>,
@@ -14,7 +14,7 @@ pub struct ControlPipe<'d> {
 
 impl<'d> ControlPipe<'d> {
     pub(crate) fn new(
-        state: &'d RefCell<State>,
+        state: &'d RefCell<State<'d>>,
         max_packet_size: u16,
         ep_in: EndpointIn<'d>,
         ep_out: EndpointOut<'d>,

@@ -6,11 +6,11 @@ use futures::future::poll_fn;
 use log::trace;
 
 pub struct Bus<'d> {
-    state: &'d RefCell<State>,
+    state: &'d RefCell<State<'d>>,
 }
 
 impl<'d> Bus<'d> {
-    pub(crate) fn new(state: &'d RefCell<State>) -> Self {
+    pub(crate) fn new(state: &'d RefCell<State<'d>>) -> Self {
         Self { state }
     }
 }

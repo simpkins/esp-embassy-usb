@@ -5,18 +5,18 @@ use futures::future::poll_fn; // TODO: switch to core::future::poll_fn?
 use log::trace;
 
 pub struct EndpointIn<'d> {
-    state: &'d RefCell<State>,
+    state: &'d RefCell<State<'d>>,
     pub(crate) info: EndpointInfo,
 }
 
 pub struct EndpointOut<'d> {
-    state: &'d RefCell<State>,
+    state: &'d RefCell<State<'d>>,
     pub(crate) info: EndpointInfo,
 }
 
 impl<'d> EndpointIn<'d> {
     pub(crate) fn new(
-        state: &'d RefCell<State>,
+        state: &'d RefCell<State<'d>>,
         index: usize,
         ep_type: EndpointType,
         max_packet_size: u16,
@@ -36,7 +36,7 @@ impl<'d> EndpointIn<'d> {
 
 impl<'d> EndpointOut<'d> {
     pub(crate) fn new(
-        state: &'d RefCell<State>,
+        state: &'d RefCell<State<'d>>,
         index: usize,
         ep_type: EndpointType,
         max_packet_size: u16,

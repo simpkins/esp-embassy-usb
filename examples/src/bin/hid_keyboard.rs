@@ -4,12 +4,12 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
-use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State};
+use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State as HidState};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Handler};
 use embedded_hal_async::digital::Wait;
 use esp_backtrace as _;
-use esp_embassy_usb::{Config as DriverConfig, Driver};
+use esp_embassy_usb::{Config as UsbConfig, State};
 use esp_hal::gpio;
 use esp_hal::timer::TimerGroup;
 use esp_hal::{clock::ClockControl, peripherals::Peripherals, prelude::*};
@@ -34,15 +34,15 @@ async fn main(_spawner: Spawner) {
     esp_hal::embassy::init(&clocks, timg0);
 
     let io = gpio::IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let driver_config = DriverConfig::default();
+    let config = UsbConfig::default();
     log::info!("creating usb driver");
-    let driver = Driver::new(
+    let mut state = State::new(
         peripherals.USB0,
         peripherals.USB_WRAP,
         &peripherals.LPWR,
         io.pins.gpio19,
         io.pins.gpio20,
-        driver_config,
+        config,
     );
 
     log::info!("driver created");
@@ -66,10 +66,10 @@ async fn main(_spawner: Spawner) {
     let request_handler = MyRequestHandler {};
     let mut device_handler = MyDeviceHandler::new();
 
-    let mut state = State::new();
+    let mut hid_state = HidState::new();
 
     let mut builder = Builder::new(
-        driver,
+        state.driver(),
         config,
         &mut config_descriptor,
         &mut bos_descriptor,
@@ -87,7 +87,7 @@ async fn main(_spawner: Spawner) {
         max_packet_size: 8,
     };
 
-    let hid = HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut state, config);
+    let hid = HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut hid_state, config);
 
     // Build the builder.
     let mut usb = builder.build();

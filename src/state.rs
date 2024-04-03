@@ -1,46 +1,26 @@
 use crate::driver::FifoSettings;
-use crate::regs::{
-    get_usb0_register_block, Usb0RegisterBlock, NUM_IN_ENDPOINTS, NUM_OUT_ENDPOINTS,
-};
+use crate::regs::{get_usb0_register_block, NUM_IN_ENDPOINTS, NUM_OUT_ENDPOINTS};
 use crate::Config;
 use core::cell::RefCell;
-use core::mem::MaybeUninit;
 use core::task::Poll;
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::{EndpointError, EndpointType, Event};
-use esp_hal::peripherals::Interrupt;
+use esp_hal::peripheral::PeripheralRef;
+use esp_hal::peripherals::{Interrupt, USB0};
 use log::{error, trace, warn};
-
-// The global State singleton.
-// It's unfortunate that this has to be global, but the embassy-usb API doesn't provide us with any
-// place to store state that needs to be shared by the Bus, ControlPipe, and Endpoints.  (It would
-// seem nicer if Driver::start() instead returned a single State object, instead of returning
-// separate Bus and ControlPipe objects with no place for shared state.)
-//
-// We only ever access this STATE variable in Driver::start(), when it is first initialized.  This
-// would make it easy to remove this static global variable in the future if the embassy-usb APIs
-// were updated to allow returning a State object directly to users.
-//
-// We use a RefCell to validate that access from the Bus, ControlPipe, and Endpoints are safe.  The
-// main rule is that we only borrow the RefCell within poll_fn() calls, so that it is only borrowed
-// for the duration of a single poll check, and we always release it before yielding back to the
-// executor.
-//
-// TODO: for optimization purposes, we could perhaps replace the RefCell with a no-op wrapper that
-// doesn't actually do checks in release builds.
-pub(crate) static mut STATE: MaybeUninit<RefCell<State>> = MaybeUninit::zeroed();
 
 // The BUS_WAKER, used by the interrupt handler to wake the main task to perform work.
 // This has to be global so it can be accessed by the USB interrupt handler.
 pub(crate) static BUS_WAKER: AtomicWaker = AtomicWaker::new();
 
 // This structure keeps track of common shared state needed by the Bus, ControlPipe, and endpoints.
-pub(crate) struct State {
+pub(crate) struct State<'d> {
     // TODO: it would perhaps be nicer to remove the usb0 member variable to save space.
     // We shouldn't really need to store this pointer, and we should be able to just access
     // the pointer as a constant.  However, I don't believe esp_hal exposes the pointer value as a
     // constant.  We perhaps should just define the correct target-specific address in regs.rs
-    usb0: &'static Usb0RegisterBlock,
+    usb0: &'static crate::regs::Usb0RegisterBlock,
+    _usb0: PeripheralRef<'d, USB0>,
 
     config: Config,
     ep0_mps_bits: u8,
@@ -78,7 +58,7 @@ pub(crate) struct State {
 #[derive(Debug)]
 pub(crate) struct InvalidControlMaxPacketSize;
 
-impl State {
+impl<'d> State<'d> {
     // Safety: it would be more correct for this API to accept a (Peripheral<P = USB0> + 'd) as an
     // argument, and then have the State lifetime be associated with the lifetime of the USB0
     // peripheral reference we were given.
@@ -92,9 +72,14 @@ impl State {
     // It would sort of be nice if we could reference count users of the State and automatically
     // reset the peripheral when all references were dropped.  That said, in practice most users
     // will likely keep the USB Driver for the duration of their program.
-    pub fn new(config: Config) -> Self {
+    //
+    // TODO: this should probably accept in 'impl Peripheral', but at the moment we have to convert
+    // the Peripheral to a PeripheralRef first in order to let esp_hal::otg_fs::USB initialize
+    // the USB peripheral clock.
+    pub fn new(usb0: PeripheralRef<'d, USB0>, config: Config) -> Self {
         Self {
             usb0: unsafe { get_usb0_register_block() },
+            _usb0: usb0,
             config,
             ep0_mps_bits: 0,
             bus_event_flags: 0,
@@ -1502,11 +1487,11 @@ impl State {
     }
 }
 
-pub(crate) async fn start_read_op<'b>(
-    state: &'b RefCell<State>,
+pub(crate) async fn start_read_op<'b, 'd>(
+    state: &'d RefCell<State<'d>>,
     ep_index: usize,
     buf: &'b mut [u8],
-) -> Result<ReadOperation<'b>, EndpointError> {
+) -> Result<ReadOperation<'b, 'd>, EndpointError> {
     futures::future::poll_fn(|cx| {
         let mut state = state.borrow_mut();
         state.poll_out_ep_start_read(cx, ep_index, buf)
@@ -1524,13 +1509,13 @@ pub(crate) async fn start_read_op<'b>(
 ///
 /// This allows us to be notified when it is dropped, and ask the hardware to stop accepting OUT
 /// packets if our caller cancels the read.
-pub(crate) struct ReadOperation<'b> {
-    state: &'b RefCell<State>,
+pub(crate) struct ReadOperation<'b, 'd> {
+    state: &'d RefCell<State<'d>>,
     buf: &'b mut [u8],
     ep_index: usize,
 }
 
-impl<'b> ReadOperation<'b> {
+impl<'b, 'd> ReadOperation<'b, 'd> {
     pub(crate) async fn do_read(&mut self) -> Result<usize, EndpointError> {
         futures::future::poll_fn(|cx| {
             let mut state = self.state.borrow_mut();
@@ -1540,7 +1525,7 @@ impl<'b> ReadOperation<'b> {
     }
 }
 
-impl<'b> Drop for ReadOperation<'b> {
+impl<'b, 'd> Drop for ReadOperation<'b, 'd> {
     fn drop(&mut self) {
         // ReadOperation objects are owned by higher level code, and should never be
         // dropped during any operation where we have already borrowed self.state
