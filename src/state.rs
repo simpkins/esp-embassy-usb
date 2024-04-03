@@ -7,7 +7,7 @@ use core::cell::RefCell;
 use core::mem::MaybeUninit;
 use core::task::Poll;
 use embassy_sync::waitqueue::AtomicWaker;
-use embassy_usb_driver::{EndpointError, Event};
+use embassy_usb_driver::{EndpointError, EndpointType, Event};
 use esp_hal::peripherals::Interrupt;
 use log::{error, trace, warn};
 
@@ -46,9 +46,13 @@ pub(crate) struct State {
     ep0_mps_bits: u8,
     bus_event_flags: u8,
     initialized: bool,
-
-    ep0_setup_data: [u32; 2],
     ep0_setup_ready: bool,
+    ep0_setup_data: [u32; 2],
+
+    // TODO: move the endpoint allocation code into State, and drop the pub(crate) attributes here
+    pub(crate) ep_in_config: [Option<InEndpointConfig>; NUM_IN_ENDPOINTS],
+    pub(crate) ep_out_config: [Option<OutEndpointConfig>; NUM_OUT_ENDPOINTS],
+
     ep_in_waker: [AtomicWaker; NUM_IN_ENDPOINTS],
     ep_out_waker: [AtomicWaker; NUM_OUT_ENDPOINTS],
 
@@ -97,6 +101,8 @@ impl State {
             initialized: false,
             ep0_setup_data: [0; 2],
             ep0_setup_ready: false,
+            ep_in_config: [None; NUM_IN_ENDPOINTS],
+            ep_out_config: [None; NUM_OUT_ENDPOINTS],
             ep_in_waker: core::array::from_fn(|_| AtomicWaker::new()),
             ep_out_waker: core::array::from_fn(|_| AtomicWaker::new()),
             ep_out_readers: core::array::from_fn(|_| ReadBuf::new()),
@@ -346,6 +352,7 @@ impl State {
         cx: &mut core::task::Context,
         ep_index: usize,
     ) -> Poll<()> {
+        trace!("OUT EP{} poll polling for enabled", ep_index);
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
             self.poll_usb(cx);
@@ -354,6 +361,7 @@ impl State {
         self.ep_out_waker[ep_index].register(cx.waker());
         let doepctl = self.usb0.out_ep(ep_index).doepctl().read();
         if doepctl.usbactep1().bit_is_set() {
+            trace!("OUT EP{} poll enabled returning ready", ep_index);
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -495,6 +503,7 @@ impl State {
         cx: &mut core::task::Context,
         ep_index: usize,
     ) -> Poll<()> {
+        trace!("IN EP{} polling for enabled", ep_index);
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
             self.poll_usb(cx);
@@ -503,6 +512,7 @@ impl State {
         self.ep_in_waker[ep_index].register(cx.waker());
         let diepctl = self.usb0.in_ep(ep_index).diepctl().read();
         if diepctl.d_usbactep1().bit_is_set() {
+            trace!("IN EP{} poll enabled returning ready", ep_index);
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -1340,71 +1350,112 @@ impl State {
     }
 
     pub fn enable_in_ep(&mut self, ep_index: usize) {
-        /*{
-            critical_section::with(|_| {
-                // cancel transfer if active
-                if !enabled && r.diepctl(ep_addr.index()).read().epena() {
-                    r.diepctl(ep_addr.index()).modify(|w| {
-                        w.set_snak(true); // set NAK
-                        w.set_epdis(true);
-                    })
-                }
+        trace!("enabling IN EP{}", ep_index);
+        let ep_in = self.usb0.in_ep(ep_index);
 
-                r.diepctl(ep_addr.index()).modify(|w| {
-                    w.set_usbaep(enabled);
-                    w.set_cnak(enabled); // clear NAK that might've been set by SNAK above.
-                })
-            });
-        }
-        */
+        // We currently always assign each IN endpoint to the TX FIFO with the same number.
+        let fifo_num = ep_index as u8;
+        let config = match self.ep_in_config[ep_index] {
+            None => {
+                // This endpoint isn't configured.
+                // It would be nice if we could return an error here.
+                return;
+            }
+            Some(cfg) => cfg,
+        };
+
+        ep_in.diepctl().modify(|r, w| {
+            // FIXME: the esp-pacs definitions for diepctl are broken
+            /*
+                w.d_usbactep1()
+                    .set_bit()
+                    .d_txfnum1()
+                    .bits(fifo_num)
+                    .mps()
+                    .bits(config.max_packet_size)
+                    .d_eptype1()
+                    .bits(config.ep_type as u8)
+                    .di_setd0pid1()
+                    .set_bit()
+            */
+            let bits = r.bits() & !0x33cc07ff;
+            let (fifo_bits, _) = fifo_num.overflowing_shl(22);
+            let (ep_type_bits, _) = (config.ep_type as u8).overflowing_shl(18);
+            let bits = bits
+                | (1 << 15)
+                | (fifo_bits as u32)
+                | (ep_type_bits as u32)
+                | (config.max_packet_size as u32)
+                | (1 << 28);
+            unsafe { w.bits(bits) }
+        });
+
+        // Enable interrupts for this endpoint
+        self.usb0.daintmsk().modify(|r, w| {
+            let bits = r.bits() | (1 << ep_index);
+            unsafe { w.bits(bits) }
+        });
 
         // Wake the endpoint, in case some task is waiting in poll_in_ep_enabled()
         self.ep_in_waker[ep_index].wake();
     }
 
     pub fn enable_out_ep(&mut self, ep_index: usize) {
-        // TODO
-        /*
-            critical_section::with(|_| {
-                // cancel transfer if active
-                if !enabled && r.doepctl(ep_addr.index()).read().epena() {
-                    r.doepctl(ep_addr.index()).modify(|w| {
-                        w.set_snak(true);
-                        w.set_epdis(true);
-                    })
-                }
+        trace!("enabling OUT EP{}", ep_index);
+        let ep_out = self.usb0.out_ep(ep_index);
 
-                r.doepctl(ep_addr.index()).modify(|w| {
-                    w.set_usbaep(enabled);
-                });
+        let config = match self.ep_out_config[ep_index] {
+            None => {
+                // This endpoint isn't configured.
+                // It would be nice if we could return an error here.
+                return;
+            }
+            Some(cfg) => cfg,
+        };
 
-                // Flush tx fifo
-                r.grstctl().write(|w| {
-                    w.set_txfflsh(true);
-                    w.set_txfnum(ep_addr.index() as _);
-                });
-                loop {
-                    let x = r.grstctl().read();
-                    if !x.txfflsh() {
-                        break;
-                    }
-                }
-            });
-        */
+        trace!("enabling IN EP{}", ep_index);
+        ep_out.doepctl().modify(|r, w| {
+            /*
+            w.usbactep1()
+                .set_bit()
+                .mps1()
+                .bits(config.max_packet_size)
+                .eptype1()
+                .bits(config.ep_type as u8)
+                .do_setd0pid1()
+                .set_bit()
+            */
+            let bits = r.bits() & !0x300c07ff;
+            let (ep_type_bits, _) = (config.ep_type as u8).overflowing_shl(18);
+            let bits = bits
+                | (1 << 15)
+                | (ep_type_bits as u32)
+                | (config.max_packet_size as u32)
+                | (1 << 29);
+            unsafe { w.bits(bits) }
+        });
 
-        // Wake the endpoint, in case some task is waiting in poll_in_ep_enabled()
+        // Enable interrupts for this endpoint
+        self.usb0.daintmsk().modify(|r, w| {
+            let bits = r.bits() | (1 << (16 + ep_index));
+            unsafe { w.bits(bits) }
+        });
+
+        // Wake the endpoint, in case some task is waiting in poll_out_ep_enabled()
         self.ep_out_waker[ep_index].wake();
     }
 
-    pub fn disable_in_ep(&mut self, _ep_index: usize) {
+    pub fn disable_in_ep(&mut self, ep_index: usize) {
         // TODO
+        error!("TODO: disable IN EP{}", ep_index);
     }
 
-    pub fn disable_out_ep(&mut self, _ep_index: usize) {
+    pub fn disable_out_ep(&mut self, ep_index: usize) {
         // The global OUT NAK flag must be set before disabling any OUT endpoint.
         self.set_global_out_nak();
 
         // TODO
+        error!("TODO: disable OUT EP{}", ep_index);
 
         // Exit global OUT NAK mode
         self.usb0.dctl().modify(|_, w| w.cgoutnak().set_bit());
@@ -1643,4 +1694,16 @@ mod devspd {
     // pub(crate) const _FULL_30MHZ: u32 = 1;
     // pub(crate) const _LOW_6MHZ: u32 = 2;
     pub(crate) const FULL_48MHZ: u32 = 3;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InEndpointConfig {
+    pub(crate) ep_type: EndpointType,
+    pub(crate) max_packet_size: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutEndpointConfig {
+    pub(crate) ep_type: EndpointType,
+    pub(crate) max_packet_size: u16,
 }

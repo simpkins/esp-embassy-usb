@@ -1,10 +1,8 @@
 use crate::bus::Bus;
 use crate::control_pipe::ControlPipe;
 use crate::endpoint::{EndpointIn, EndpointOut};
-use crate::endpoint::{InEndpointConfig, OutEndpointConfig};
 use crate::phy::init_phy;
-use crate::regs::{NUM_IN_ENDPOINTS, NUM_OUT_ENDPOINTS};
-use crate::state::State;
+use crate::state::{InEndpointConfig, OutEndpointConfig, State};
 use crate::{Config, PhyType};
 use core::cell::RefCell;
 use embassy_usb_driver::{EndpointAllocError, EndpointType};
@@ -15,8 +13,6 @@ use log::{error, trace};
 
 pub struct Driver<'d> {
     state: &'d RefCell<State>,
-    ep_in: [Option<InEndpointConfig>; NUM_IN_ENDPOINTS],
-    ep_out: [Option<OutEndpointConfig>; NUM_OUT_ENDPOINTS],
     fifo_settings: FifoSettings,
 }
 
@@ -188,8 +184,6 @@ impl<'d> Driver<'d> {
 
         Self {
             state,
-            ep_in: [None; NUM_IN_ENDPOINTS],
-            ep_out: [None; NUM_OUT_ENDPOINTS],
             fifo_settings: FifoSettings::new(),
         }
     }
@@ -232,7 +226,8 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
             interval_ms,
         );
 
-        let slot_index = Self::find_free_endpoint_slot(&mut self.ep_in, ep_type)?;
+        let mut state = self.state.borrow_mut();
+        let slot_index = Self::find_free_endpoint_slot(&mut state.ep_in_config, ep_type)?;
         if ep_type == EndpointType::Control && slot_index != 0 {
             // The embassy-usb API assumes there is only ever a single control pipe, and does not
             // expect SETUP packets on other endpoints.  The hardware and the USB spec both
@@ -252,8 +247,8 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
         self.fifo_settings
             .allocate_tx_fifo(fifo_index, max_packet_size)?;
 
-        // Now that we know allocation is successful, update the self.ep_in array
-        self.ep_in[slot_index] = Some(InEndpointConfig {
+        // Now that we know allocation is successful, update the ep_in_config array
+        state.ep_in_config[slot_index] = Some(InEndpointConfig {
             ep_type,
             max_packet_size,
         });
@@ -279,7 +274,8 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
             interval_ms,
         );
 
-        let slot_index = Self::find_free_endpoint_slot(&mut self.ep_out, ep_type)?;
+        let mut state = self.state.borrow_mut();
+        let slot_index = Self::find_free_endpoint_slot(&mut state.ep_out_config, ep_type)?;
         if ep_type == EndpointType::Control && slot_index != 0 {
             // The embassy-usb API assumes there is only ever a single control pipe, and does not
             // expect SETUP packets on other endpoints.  The hardware and the USB spec both
@@ -289,7 +285,7 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
             return Err(EndpointAllocError);
         }
 
-        self.ep_out[slot_index] = Some(OutEndpointConfig {
+        state.ep_out_config[slot_index] = Some(OutEndpointConfig {
             ep_type,
             max_packet_size,
         });
@@ -306,29 +302,33 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
     fn start(mut self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
         // It's sort of unfortunate that start() cannot return an error, and has to panic
         // on any failure.
-        self.state
-            .borrow_mut()
-            .set_ep0_max_packet_size(control_max_packet_size)
-            .expect("invalid max_packet_size for control endpoint");
 
-        let ep_out = self
+        let ep0_out = self
             .alloc_endpoint_out(EndpointType::Control, control_max_packet_size, 0)
             .unwrap();
-        let ep_in = self
+        let ep0_in = self
             .alloc_endpoint_in(EndpointType::Control, control_max_packet_size, 0)
             .unwrap();
-        assert_eq!(ep_out.info.addr.index(), 0);
-        assert_eq!(ep_in.info.addr.index(), 0);
+        assert_eq!(ep0_out.info.addr.index(), 0);
+        assert_eq!(ep0_in.info.addr.index(), 0);
 
-        // Redistribute any remaining free FIFO space
-        self.fifo_settings.redistribute_free_space(&self.ep_in);
+        {
+            let mut state = self.state.borrow_mut();
+            state
+                .set_ep0_max_packet_size(control_max_packet_size)
+                .expect("invalid max_packet_size for control endpoint");
 
-        trace!("start");
-        self.state.borrow_mut().init_bus(&self.fifo_settings);
+            // Redistribute any remaining free FIFO space
+            self.fifo_settings
+                .redistribute_free_space(&state.ep_in_config);
+
+            trace!("start");
+            state.init_bus(&self.fifo_settings);
+        }
 
         (
             Bus::new(self.state),
-            ControlPipe::new(self.state, control_max_packet_size, ep_in, ep_out),
+            ControlPipe::new(self.state, control_max_packet_size, ep0_in, ep0_out),
         )
     }
 }

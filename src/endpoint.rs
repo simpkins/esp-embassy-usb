@@ -144,15 +144,3 @@ impl<'d> embassy_usb_driver::EndpointIn for EndpointIn<'d> {
         .await
     }
 }
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct InEndpointConfig {
-    pub(crate) ep_type: EndpointType,
-    pub(crate) max_packet_size: u16,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct OutEndpointConfig {
-    pub(crate) ep_type: EndpointType,
-    pub(crate) max_packet_size: u16,
-}
