@@ -45,5 +45,12 @@ esp32s3 = ["dep:esp32s3", "esp-hal/esp32s3"]
 # A patch which includes https://github.com/twitchyliquid64/usbd-hid/pull/63
 usbd-hid-macros = { path = "../../src/usbd-hid/macros" }
 usbd-hid = { path = "../../src/usbd-hid" }
+# esp-pacs / esp-hal updates to include https://github.com/esp-rs/esp-pacs/pull/213
+esp32s3 = { path = "../../src/esp-pacs/esp32s3" }
+esp32s3-ulp = { path = "../../src/esp-pacs/esp32s3-ulp" }
+esp-hal = { path = "../../src/esp-hal/esp-hal" }
+esp-lp-hal = { path = "../../src/esp-hal/esp-lp-hal" }
+esp-hal-procmacros = { path = "../../src/esp-hal/esp-hal-procmacros" }
+# Just to let me add some extra debug statements during testing
 embassy-usb = { path = "../../src/embassy/embassy-usb" }
 embassy-usb-driver = { path = "../../src/embassy/embassy-usb-driver" }

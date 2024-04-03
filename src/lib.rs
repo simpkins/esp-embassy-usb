@@ -14,7 +14,6 @@ mod driver;
 mod endpoint;
 mod interrupt;
 mod phy;
-pub mod regs;
 mod state;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

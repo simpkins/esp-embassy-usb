@@ -7,7 +7,6 @@ use embassy_executor::Spawner;
 use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State as HidState};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Handler};
-use embedded_hal_async::digital::Wait;
 use esp_backtrace as _;
 use esp_embassy_usb::{Config as UsbConfig, State};
 use esp_hal::gpio;
@@ -30,7 +29,7 @@ async fn main(_spawner: Spawner) {
     let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::max(system.clock_control).freeze();
 
-    let timg0 = TimerGroup::new(peripherals.TIMG0, &clocks);
+    let timg0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
     esp_hal::embassy::init(&clocks, timg0);
 
     let io = gpio::IO::new(peripherals.GPIO, peripherals.IO_MUX);

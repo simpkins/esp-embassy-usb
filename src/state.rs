@@ -1,5 +1,4 @@
 use crate::driver::FifoSettings;
-use crate::regs::{get_usb0_register_block, NUM_IN_ENDPOINTS, NUM_OUT_ENDPOINTS};
 use crate::Config;
 use core::cell::RefCell;
 use core::task::Poll;
@@ -9,18 +8,16 @@ use esp_hal::peripheral::PeripheralRef;
 use esp_hal::peripherals::{Interrupt, USB0};
 use log::{error, trace, warn};
 
+pub const NUM_IN_ENDPOINTS: usize = 7;
+pub const NUM_OUT_ENDPOINTS: usize = 7;
+
 // The BUS_WAKER, used by the interrupt handler to wake the main task to perform work.
 // This has to be global so it can be accessed by the USB interrupt handler.
 pub(crate) static BUS_WAKER: AtomicWaker = AtomicWaker::new();
 
 // This structure keeps track of common shared state needed by the Bus, ControlPipe, and endpoints.
 pub(crate) struct State<'d> {
-    // TODO: it would perhaps be nicer to remove the usb0 member variable to save space.
-    // We shouldn't really need to store this pointer, and we should be able to just access
-    // the pointer as a constant.  However, I don't believe esp_hal exposes the pointer value as a
-    // constant.  We perhaps should just define the correct target-specific address in regs.rs
-    usb0: &'static crate::regs::Usb0RegisterBlock,
-    _usb0: PeripheralRef<'d, USB0>,
+    usb0: PeripheralRef<'d, USB0>,
 
     config: Config,
     ep0_mps_bits: u8,
@@ -78,8 +75,7 @@ impl<'d> State<'d> {
     // the USB peripheral clock.
     pub fn new(usb0: PeripheralRef<'d, USB0>, config: Config) -> Self {
         Self {
-            usb0: unsafe { get_usb0_register_block() },
-            _usb0: usb0,
+            usb0: usb0,
             config,
             ep0_mps_bits: 0,
             bus_event_flags: 0,
@@ -322,7 +318,7 @@ impl<'d> State<'d> {
         self.usb0
             .out_ep0()
             .doeptsiz()
-            .modify(|_, w| unsafe { w.supcnt0().bits(3) });
+            .modify(|_, w| unsafe { w.supcnt().bits(3) });
 
         trace!(
             "SETUP ready: {:?}",
@@ -341,11 +337,14 @@ impl<'d> State<'d> {
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
             self.poll_usb(cx);
+
+            // Endpoint 0 is always enabled.
+            return Poll::Ready(());
         }
 
         self.ep_out_waker[ep_index].register(cx.waker());
-        let doepctl = self.usb0.out_ep(ep_index).doepctl().read();
-        if doepctl.usbactep1().bit_is_set() {
+        let doepctl = self.usb0.out_ep(ep_index - 1).doepctl().read();
+        if doepctl.usbactep().bit_is_set() {
             trace!("OUT EP{} poll enabled returning ready", ep_index);
             Poll::Ready(())
         } else {
@@ -359,19 +358,22 @@ impl<'d> State<'d> {
         ep_index: usize,
         buf: &mut [u8],
     ) -> Poll<Result<(), EndpointError>> {
+        trace!("OUT EP{} RX: polling for start read", ep_index);
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
             self.poll_usb(cx);
         }
 
-        self.ep_out_waker[ep_index].register(cx.waker());
-
-        let out_ep = self.usb0.out_ep(ep_index);
-        let doepctl = out_ep.doepctl().read();
-        if doepctl.usbactep1().bit_is_clear() {
-            trace!("OUT EP{} RX: endpoint is disabled", ep_index);
-            return Poll::Ready(Err(EndpointError::Disabled));
+        let ep_config = match self.ep_out_config[ep_index] {
+            Some(config) => config,
+            None => {
+                return Poll::Ready(Err(EndpointError::Disabled));
+            }
+        };
+        if let Some(err) = self.check_out_read_error(ep_index, false) {
+            return Poll::Ready(Err(err));
         }
+        self.ep_out_waker[ep_index].register(cx.waker());
 
         // Try to register as the current reader for this endpoint
         if self.ep_out_readers[ep_index].set_reader(buf).is_err() {
@@ -392,23 +394,31 @@ impl<'d> State<'d> {
         // We always ask for max_packet_size at once, even if the reader asked for less.
         // If the host sends more data in the transfer than the user requested, we want to know and
         // generate an error.
-        // We read max_packet_size from doepctl just to avoid the caller having to pass it in.
-        let max_packet_size = out_ep.doepctl().read().mps1().bits();
-        let read_size = max_packet_size;
+        let read_size = ep_config.max_packet_size;
         assert!(read_size as usize >= buf.len());
-        out_ep.doeptsiz().modify(|r, w| {
-            // Doh.  The DOEPTSIZ register definition in the esp-pacs crate is pretty broken,
-            // and has wrong field widths for pktcnt and xfersize.  Manually construct the value
-            // for now.
-            // TODO: update this if https://github.com/esp-rs/esp-pacs/pull/213
-            // is merged.
-            let value = (r.bits() & 0xe0000000) | (read_size as u32) | ((NUM_PACKETS as u32) << 19);
-            unsafe { w.bits(value) }
-        });
-        // Clear the NAK flag and enable endpoint to allow the hardware to start reading.
-        out_ep
-            .doepctl()
-            .modify(|_, w| w.cnak1().set_bit().epena1().set_bit());
+        if ep_index == 0 {
+            let out_ep = self.usb0.out_ep0();
+            // Endpoint 0 only supports reading up to 1 OUT packet at a time
+            out_ep
+                .doeptsiz()
+                .modify(|_, w| w.xfersize().bits(read_size as u8).pktcnt().set_bit());
+            // Clear the NAK flag and enable endpoint to allow the hardware to start reading.
+            out_ep
+                .doepctl()
+                .modify(|_, w| w.cnak().set_bit().epena().set_bit());
+        } else {
+            let out_ep = self.usb0.out_ep(ep_index - 1);
+            out_ep.doeptsiz().modify(|_, w| {
+                w.xfersize()
+                    .bits(read_size as u32)
+                    .pktcnt()
+                    .bits(NUM_PACKETS as u16)
+            });
+            // Clear the NAK flag and enable endpoint to allow the hardware to start reading.
+            out_ep
+                .doepctl()
+                .modify(|_, w| w.cnak().set_bit().epena().set_bit());
+        }
 
         Poll::Ready(Ok(()))
     }
@@ -418,27 +428,40 @@ impl<'d> State<'d> {
         cx: &mut core::task::Context,
         ep_index: usize,
     ) -> Poll<Result<usize, EndpointError>> {
+        trace!("OUT EP{} RX: polling for read complete", ep_index);
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
             self.poll_usb(cx);
         }
 
-        trace!("OUT EP{} RX: polling for read complete", ep_index);
-        self.ep_out_waker[ep_index].register(cx.waker());
-
         if let Some(result) = self.ep_out_readers[ep_index].check_read_complete() {
             return Poll::Ready(result);
         }
+        if let Some(err) = self.check_out_read_error(ep_index, true) {
+            return Poll::Ready(Err(err));
+        }
 
+        self.ep_out_waker[ep_index].register(cx.waker());
+        Poll::Pending
+    }
+
+    fn check_out_read_error(
+        &mut self,
+        ep_index: usize,
+        already_reading: bool,
+    ) -> Option<EndpointError> {
         if ep_index == 0 {
-            // If the bus is reset while we are reading, endpoint 0 doesn't get disabled
-            // but we do set the OUT NAK flag for it.  Check to see if this has been disabled.
-            let out_ep = self.usb0.out_ep0();
-            let doepctl = out_ep.doepctl().read();
-            trace!("  EP0 doepctl: {:?}", doepctl);
-            if doepctl.naksts0().bit_is_set() {
-                warn!("bus reset while attempting to read from EP0");
-                return Poll::Ready(Err(EndpointError::Disabled));
+            if already_reading {
+                // If the bus is reset while we are reading, endpoint 0 doesn't get disabled
+                // but the NAK flag will be set on it.  Check to see if the NAK flag has been
+                // disabled since we started our read attempt.
+                let out_ep = self.usb0.out_ep0();
+                let doepctl = out_ep.doepctl().read();
+                trace!("  EP0 doepctl: {:?}", doepctl);
+                if doepctl.naksts().bit_is_set() {
+                    warn!("bus reset while attempting to read from EP0");
+                    return Some(EndpointError::Disabled);
+                }
             }
 
             // If we are trying to read from endpoint 0 and we see a SETUP packet instead of an OUT
@@ -448,20 +471,20 @@ impl<'d> State<'d> {
             if ep_index == 0 && self.ep0_setup_ready {
                 error!("received SETUP packet on EP0 while expecting an OUT packet");
                 // There unfortunately isn't a good EndpointError code for us to return here.
-                return Poll::Ready(Err(EndpointError::Disabled));
+                return Some(EndpointError::Disabled);
             }
         } else {
             // If the endpoint is disabled, fail the read.
             // This can happen if the bus is reset while we are attempting to read.
-            let out_ep = self.usb0.out_ep(ep_index);
+            let out_ep = self.usb0.out_ep(ep_index - 1);
             let doepctl = out_ep.doepctl().read();
-            if doepctl.usbactep1().bit_is_clear() {
+            if doepctl.usbactep().bit_is_clear() {
                 trace!("OUT EP{} RX: endpoint has been disabled", ep_index);
-                return Poll::Ready(Err(EndpointError::Disabled));
+                return Some(EndpointError::Disabled);
             }
         }
 
-        Poll::Pending
+        None
     }
 
     fn read_operation_dropped(&mut self, ep_index: usize, buf: &mut [u8]) {
@@ -473,13 +496,18 @@ impl<'d> State<'d> {
             // Ask the hardware to NAK new OUT packets and disable active transfers.
             // Note: this is not immediately effective, and the hardware may still place another packet
             // for us in the RX FIFO until this takes effect.
-            self.usb0.out_ep(ep_index).doepctl().modify(|r, w| {
-                // TODO: update this if https://github.com/esp-rs/esp-pacs/pull/213
-                // is merged.
-                // w.epdis1().set_bit().snak1().set_bit()
-                let value = r.bits() | 0x48000000;
-                unsafe { w.bits(value) }
-            });
+            if ep_index == 0 {
+                // Cannot set the EPDIS bit on endpoint 0
+                self.usb0
+                    .out_ep0()
+                    .doepctl()
+                    .modify(|_, w| w.snak().set_bit());
+            } else {
+                self.usb0
+                    .out_ep(ep_index - 1)
+                    .doepctl()
+                    .modify(|_, w| w.epdis().set_bit().snak().set_bit());
+            }
         }
     }
 
@@ -492,11 +520,13 @@ impl<'d> State<'d> {
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
             self.poll_usb(cx);
+            // Endpoint 0 is always enabled.
+            return Poll::Ready(());
         }
 
         self.ep_in_waker[ep_index].register(cx.waker());
-        let diepctl = self.usb0.in_ep(ep_index).diepctl().read();
-        if diepctl.d_usbactep1().bit_is_set() {
+        let diepctl = self.usb0.in_ep(ep_index - 1).diepctl().read();
+        if diepctl.usbactep().bit_is_set() {
             trace!("IN EP{} poll enabled returning ready", ep_index);
             Poll::Ready(())
         } else {
@@ -518,6 +548,7 @@ impl<'d> State<'d> {
         fifo_index: usize,
         buf: &[u8],
     ) -> Poll<Result<(), EndpointError>> {
+        trace!("IN EP{} TX: polling for write", ep_index);
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
             self.poll_usb(cx);
@@ -525,34 +556,39 @@ impl<'d> State<'d> {
 
         self.ep_in_waker[ep_index].register(cx.waker());
 
-        let ep_regs = self.usb0.in_ep(ep_index);
-        let diepctl = ep_regs.diepctl().read();
-        if diepctl.d_usbactep1().bit_is_clear() {
-            trace!("IN EP{} TX: endpoint is disabled", ep_index);
-            return Poll::Ready(Err(EndpointError::Disabled));
-        }
-        if diepctl.d_epena1().bit_is_set() {
-            trace!("IN EP{} TX: endpoint is busy", ep_index);
-            return Poll::Pending;
-        }
-
-        let dtxfsts = ep_regs.dtxfsts().read();
-        trace!(
-            "IN EP{} poll write: diepctl {:?} dtxfsts {:?}",
-            ep_index,
-            diepctl,
-            dtxfsts
-        );
+        let dtxfsts = if ep_index == 0 {
+            let ep_regs = self.usb0.in_ep0();
+            let diepctl = ep_regs.diepctl().read();
+            // Don't bother checking usbactep for endpoint 0, as this bit is always set to 1.
+            if diepctl.epena().bit_is_set() {
+                trace!("IN EP{} TX: endpoint is busy", ep_index);
+                return Poll::Pending;
+            }
+            ep_regs.dtxfsts()
+        } else {
+            let ep_regs = self.usb0.in_ep(ep_index - 1);
+            let diepctl = ep_regs.diepctl().read();
+            if diepctl.usbactep().bit_is_clear() {
+                trace!("IN EP{} TX: endpoint is disabled", ep_index);
+                return Poll::Ready(Err(EndpointError::Disabled));
+            }
+            if diepctl.epena().bit_is_set() {
+                trace!("IN EP{} TX: endpoint is busy", ep_index);
+                return Poll::Pending;
+            }
+            ep_regs.dtxfsts()
+        };
 
         // Check for available TX FIFO space.
         // (I suspect that it shouldn't be possible for this check to fail, since we only ever
         // write a single packet at a time and we wait for the endpoint to become idle before
         // starting the next write.)
         if buf.len() > 0 {
+            // Note that the STMicro docs indicate that we must not read dtxfsts if we are
+            // transmitting a 0-length packet.
+            let fifo_space_avail = dtxfsts.read().ineptxfspcavail().bits();
             let size_words = (buf.len() + 3) / 4;
-
-            let fifo_space = dtxfsts.d_ineptxfspcavail1().bits() as usize;
-            if size_words > fifo_space {
+            if size_words > (fifo_space_avail as usize) {
                 // Not enough space in the FIFO
                 // Enable the TX FIFO empty interrupt
                 trace!("IN EP{} TX: waiting for TX FIFO space", ep_index);
@@ -568,27 +604,38 @@ impl<'d> State<'d> {
         trace!("IN EP{} TX: writing {} bytes", ep_index, buf.len());
 
         // The embassy-usb APIs require callers never send more than max packet size at once, and
-        // the EndpointIn::write() cod has already verified that buf.len() is within this limit.
+        // the EndpointIn::write() code has already verified that buf.len() is within this limit.
+        // (TODO: we should support writing multiple packets at once in the future.  Note that
+        // endpoint supports only up to 3 packets at a time, while other endpoints support more.)
         const NUM_PACKETS: u8 = 1;
 
-        // First inform the core of how much data we want to send, and how many packets.
-        ep_regs.dieptsiz().write(|w| unsafe {
-            w.d_pktcnt1().bits(NUM_PACKETS);
-            w.d_xfersize1().bits(buf.len() as _)
-        });
-        // Now enable the endpoint to start writing, and clear the NAK bit.
-        //
-        // TODO: For isochronous endpoints I believe we need to manually set
-        // diepctl.setd0pid or diepctl.setd1pid.
-        ep_regs
-            .diepctl()
-            .modify(|_, w| w.d_cnak1().set_bit().d_epena1().set_bit());
-        trace!(
-            "writing to FIFO {} dieptsiz={:?} diepctl={:?}",
-            fifo_index,
-            ep_regs.dieptsiz(),
-            ep_regs.diepctl()
-        );
+        // Update dieptsiz to inform the core how much data (and how many packets) to send,
+        // and then update diepctl to clear the NAK flag and enable writing.
+        if ep_index == 0 {
+            let ep_regs = self.usb0.in_ep0();
+            ep_regs.dieptsiz().write(|w| {
+                w.pktcnt()
+                    .bits(NUM_PACKETS)
+                    .xfersize()
+                    .bits(buf.len() as u8)
+            });
+            ep_regs
+                .diepctl()
+                .modify(|_, w| w.cnak().set_bit().epena().set_bit());
+        } else {
+            let ep_regs = self.usb0.in_ep(ep_index - 1);
+            ep_regs.dieptsiz().write(|w| {
+                w.pktcnt()
+                    .bits(NUM_PACKETS as u16)
+                    .xfersize()
+                    .bits(buf.len() as u32)
+            });
+            // TODO: For isochronous endpoints I believe we need to manually set
+            // diepctl.setd0pid or diepctl.setd1pid.
+            ep_regs
+                .diepctl()
+                .modify(|_, w| w.cnak().set_bit().epena().set_bit());
+        }
 
         // Finally write all data to the FIFO
         self.write_to_fifo(buf, fifo_index);
@@ -790,7 +837,7 @@ impl<'d> State<'d> {
         self.usb0
             .out_ep0()
             .doeptsiz()
-            .modify(|_, w| unsafe { w.supcnt0().bits(3) });
+            .modify(|_, w| unsafe { w.supcnt().bits(3) });
     }
 
     fn process_enum_done(&mut self) {
@@ -809,14 +856,14 @@ impl<'d> State<'d> {
         // according to comments in the tinyusb code.
         self.usb0.in_ep0().diepctl().modify(|_, w| {
             unsafe {
-                w.d_mps0()
+                w.mps()
                     .bits(self.ep0_mps_bits)
-                    .d_txfnum0()
+                    .txfnum()
                     .bits(EP0_TX_FIFO_NUM)
             }
-            .d_cnak0()
+            .cnak()
             .set_bit()
-            .d_stall0()
+            .stall()
             .clear_bit()
         });
     }
@@ -860,6 +907,10 @@ impl<'d> State<'d> {
                     // driver implementations also appear to process the SETUP packet here with no
                     // repercussions.  Doing the processing here lets us avoid needing to enable
                     // OUT endpoint interrupts.
+                    //
+                    // Note that we do have to process the stuppktrcvd interrupt and clear this
+                    // interrupt flag, otherwise no new SETUP_DONE events will be delivered to the
+                    // RX FIFO until it is cleared.
                     let ep_index = ctrl_word.chnum().bits();
                     if ep_index == 0 {
                         self.ep0_setup_ready = true;
@@ -883,8 +934,8 @@ impl<'d> State<'d> {
                     // SETUP_DONE event.
                     let rx_fifo = self.usb0.fifo(0);
                     if ep_index == 0 {
-                        self.ep0_setup_data[0] = rx_fifo.read();
-                        self.ep0_setup_data[1] = rx_fifo.read();
+                        self.ep0_setup_data[0] = rx_fifo.read().word().bits();
+                        self.ep0_setup_data[1] = rx_fifo.read().word().bits();
                         trace!(
                             "SETUP received: {:?} from rx_fifo address {:p}",
                             bytemuck::cast_slice::<u32, u8>(&self.ep0_setup_data),
@@ -975,18 +1026,18 @@ impl<'d> State<'d> {
                 // If the buffer is word-aligned, we can read directly into it
                 let buf_words: &mut [u32] = bytemuck::cast_slice_mut(&mut buf[0..whole_words * 4]);
                 for word in buf_words {
-                    *word = rx_fifo.read();
+                    *word = rx_fifo.read().bits();
                 }
             } else {
                 for chunk in buf.chunks_exact_mut(4) {
-                    let word: u32 = rx_fifo.read();
+                    let word: u32 = rx_fifo.read().bits();
                     chunk.copy_from_slice(bytemuck::bytes_of(&word));
                 }
             }
         }
         let remainder = buf.len() - whole_words * 4;
         if remainder > 0 {
-            let word: u32 = rx_fifo.read();
+            let word: u32 = rx_fifo.read().bits();
             buf[whole_words * 4..].copy_from_slice(&bytemuck::bytes_of(&word)[0..remainder]);
         }
     }
@@ -1004,13 +1055,13 @@ impl<'d> State<'d> {
                 // For aligned buffers, we can just use bytemuck::cast() to read the values as u32
                 let buf_words: &[u32] = bytemuck::cast_slice(&buf[0..whole_words * 4]);
                 for word in buf_words {
-                    fifo.write(*word);
+                    fifo.write(|w| w.set(*word));
                 }
             } else {
                 for chunk in buf.chunks_exact(4) {
                     let mut word = [0u8; 4];
                     word[0..4].copy_from_slice(chunk);
-                    fifo.write(bytemuck::cast(word));
+                    fifo.write(|w| w.set(bytemuck::cast(word)));
                 }
             }
         }
@@ -1019,7 +1070,7 @@ impl<'d> State<'d> {
             // Copy the final partial word
             let mut word = [0u8; 4];
             word[0..remainder].copy_from_slice(&buf[whole_words * 4..]);
-            fifo.write(bytemuck::cast(word));
+            fifo.write(|w| w.set(bytemuck::cast(word)));
         }
     }
 
@@ -1034,20 +1085,24 @@ impl<'d> State<'d> {
     }
 
     fn service_out_endpoint(&mut self, ep_index: usize) {
-        let doepint = self.usb0.out_ep(ep_index).doepint();
+        let doepint = if ep_index == 0 {
+            self.usb0.out_ep0().doepint()
+        } else {
+            self.usb0.out_ep(ep_index - 1).doepint()
+        };
         let ints = doepint.read();
         trace!("interrupt on OUT EP{}: {:#x}", ep_index, ints.bits());
 
         doepint.write(|w| {
-            w.setup1()
+            w.setup()
                 .set_bit()
-                .stuppktrcvd1()
+                .stuppktrcvd()
                 .set_bit()
-                .xfercompl1()
+                .xfercompl()
                 .set_bit()
         });
 
-        if ints.stuppktrcvd1().bit() {
+        if ints.stuppktrcvd().bit() {
             trace!("process setup received");
             // We don't do any work here, but we have to clear the interrupt bit
             // so that the USB core will generate a SETUP done event for the next transaction
@@ -1075,18 +1130,22 @@ impl<'d> State<'d> {
     }
 
     fn service_in_endpoint(&mut self, ep_index: usize) {
-        let diepint = self.usb0.in_ep(ep_index).diepint();
+        let diepint = if ep_index == 0 {
+            self.usb0.in_ep0().diepint()
+        } else {
+            self.usb0.in_ep(ep_index - 1).diepint()
+        };
         let ints = diepint.read();
         trace!("interrupt on IN EP{}: {:#x}", ep_index, ints.bits());
 
         // Clear all interrupts that we process
         // Note that txfemp is read-only, and will always be asserted when the FIFO is empty.
-        diepint.write(|w| w.d_xfercompl1().set_bit().d_timeout1().set_bit());
+        diepint.write(|w| w.xfercompl().set_bit().timeout().set_bit());
 
         // If the TX FIFO is empty, disable this interrupt for this endpoint and then wake
         // any endpoint handling code that may be pending.  (In particular, poll_in_ep_transmit()
         // cares about this if it is pending.)
-        if ints.d_txfemp1().bit_is_set() {
+        if ints.txfemp().bit_is_set() {
             trace!("TX FIFO empty on EP{}", ep_index);
             self.usb0.diepempmsk().modify(|r, w| {
                 let new_bits = r.d_ineptxfempmsk().bits() & !(1 << ep_index);
@@ -1096,7 +1155,7 @@ impl<'d> State<'d> {
 
         // The timeout interrupt is only generated for control endpoints,
         // if a timeout occurs attempting to send an IN token.
-        if ints.d_timeout1().bit_is_set() {
+        if ints.timeout().bit_is_set() {
             warn!("IN transaction timeout on EP{}", ep_index);
 
             // TODO: we probably should flush the TX FIFO after a timeout.
@@ -1113,7 +1172,7 @@ impl<'d> State<'d> {
             // host).  We ideally should store some sort of flag somewhere to inform it that the
             // control transfer has failed, so it can notice this when it polls when we wake it up.
         }
-        if ints.d_xfercompl1().bit_is_set() {
+        if ints.xfercompl().bit_is_set() {
             trace!("TX complete on EP{}", ep_index);
         }
 
@@ -1139,12 +1198,12 @@ impl<'d> State<'d> {
         self.usb0
             .out_ep0()
             .doepctl()
-            .modify(|_, w| w.do_snak0().set_bit());
+            .modify(|_, w| w.snak().set_bit());
         for n in 1..7 {
             self.usb0
-                .out_ep(n)
+                .out_ep(n - 1)
                 .doepctl()
-                .modify(|_, w| w.do_snak1().set_bit());
+                .modify(|_, w| w.snak().set_bit());
         }
     }
 
@@ -1156,15 +1215,19 @@ impl<'d> State<'d> {
     fn stop_all_in_endpoints(&mut self) {
         trace!("stop_all_in_endpoints");
         // Set the disable and NAK bits
+        // Note: The STMicro docs indicate we should only set the EPDIS bit if the EPENA bit was
+        // set.  That said, given that the core clears EPENA on its own, it doesn't seem
+        // like we can guarantee it was set already when we set the disable flag.  Unconditionally
+        // setting the EPDIS bits here seems to work fine in practice.
         self.usb0
             .in_ep0()
             .diepctl()
-            .modify(|_, w| w.d_epdis0().set_bit().di_snak0().set_bit());
+            .modify(|_, w| w.epdis().set_bit().snak().set_bit());
         for n in 1..NUM_IN_ENDPOINTS {
             self.usb0
-                .in_ep(n)
+                .in_ep(n - 1)
                 .diepctl()
-                .modify(|_, w| w.d_epdis1().set_bit().di_snak1().set_bit());
+                .modify(|_, w| w.epdis().set_bit().snak().set_bit());
         }
 
         // Wait for the disable to take effect
@@ -1174,16 +1237,16 @@ impl<'d> State<'d> {
             .in_ep0()
             .diepint()
             .read()
-            .d_epdisbld0()
+            .epdisbld()
             .bit_is_clear()
         {}
         for n in 1..NUM_IN_ENDPOINTS {
             while self
                 .usb0
-                .in_ep(n)
+                .in_ep(n - 1)
                 .diepint()
                 .read()
-                .d_epdisbld1()
+                .epdisbld()
                 .bit_is_clear()
             {}
         }
@@ -1206,12 +1269,12 @@ impl<'d> State<'d> {
         self.usb0
             .out_ep0()
             .doepctl()
-            .modify(|_, w| w.epena0().set_bit());
+            .modify(|_, w| w.epena().set_bit());
         for n in 1..NUM_OUT_ENDPOINTS {
             self.usb0
-                .out_ep(n)
+                .out_ep(n - 1)
                 .doepctl()
-                .modify(|_, w| w.epena1().set_bit());
+                .modify(|_, w| w.epena().set_bit());
         }
 
         // 2. Flush the RX FIFO:
@@ -1245,7 +1308,7 @@ impl<'d> State<'d> {
         const SNAK: u32 = 1 << 27;
         for n in 1..NUM_OUT_ENDPOINTS {
             self.usb0
-                .out_ep(n)
+                .out_ep(n - 1)
                 .doepctl()
                 .modify(|r, w| unsafe { w.bits(r.bits() | EPDIS | SNAK) });
         }
@@ -1253,16 +1316,16 @@ impl<'d> State<'d> {
         self.usb0
             .out_ep0()
             .doepctl()
-            .modify(|_, w| w.do_snak0().set_bit());
+            .modify(|_, w| w.snak().set_bit());
 
         // 6. wait for the epdis interrupt in doepintN for all endpoints
         for n in 1..NUM_OUT_ENDPOINTS {
             while self
                 .usb0
-                .out_ep(n)
+                .out_ep(n - 1)
                 .doepint()
                 .read()
-                .epdisbld1()
+                .epdisbld()
                 .bit_is_clear()
             {}
         }
@@ -1336,7 +1399,9 @@ impl<'d> State<'d> {
 
     pub fn enable_in_ep(&mut self, ep_index: usize) {
         trace!("enabling IN EP{}", ep_index);
-        let ep_in = self.usb0.in_ep(ep_index);
+        assert_ne!(ep_index, 0); // EP0 is always enabled
+        assert!(ep_index < NUM_IN_ENDPOINTS);
+        let ep_in = self.usb0.in_ep(ep_index - 1);
 
         // We currently always assign each IN endpoint to the TX FIFO with the same number.
         let fifo_num = ep_index as u8;
@@ -1349,30 +1414,19 @@ impl<'d> State<'d> {
             Some(cfg) => cfg,
         };
 
-        ep_in.diepctl().modify(|r, w| {
-            // FIXME: the esp-pacs definitions for diepctl are broken
-            /*
-                w.d_usbactep1()
-                    .set_bit()
-                    .d_txfnum1()
-                    .bits(fifo_num)
-                    .mps()
+        ep_in.diepctl().modify(|_, w| {
+            unsafe {
+                w.mps()
                     .bits(config.max_packet_size)
-                    .d_eptype1()
+                    .eptype()
                     .bits(config.ep_type as u8)
-                    .di_setd0pid1()
-                    .set_bit()
-            */
-            let bits = r.bits() & !0x33cc07ff;
-            let (fifo_bits, _) = fifo_num.overflowing_shl(22);
-            let (ep_type_bits, _) = (config.ep_type as u8).overflowing_shl(18);
-            let bits = bits
-                | (1 << 15)
-                | (fifo_bits as u32)
-                | (ep_type_bits as u32)
-                | (config.max_packet_size as u32)
-                | (1 << 28);
-            unsafe { w.bits(bits) }
+                    .txfnum()
+                    .bits(fifo_num)
+            }
+            .usbactep()
+            .set_bit()
+            .setd0pid()
+            .set_bit()
         });
 
         // Enable interrupts for this endpoint
@@ -1387,7 +1441,9 @@ impl<'d> State<'d> {
 
     pub fn enable_out_ep(&mut self, ep_index: usize) {
         trace!("enabling OUT EP{}", ep_index);
-        let ep_out = self.usb0.out_ep(ep_index);
+        assert_ne!(ep_index, 0); // EP0 is always enabled
+        assert!(ep_index < NUM_OUT_ENDPOINTS);
+        let ep_out = self.usb0.out_ep(ep_index - 1);
 
         let config = match self.ep_out_config[ep_index] {
             None => {
@@ -1399,25 +1455,15 @@ impl<'d> State<'d> {
         };
 
         trace!("enabling IN EP{}", ep_index);
-        ep_out.doepctl().modify(|r, w| {
-            /*
-            w.usbactep1()
-                .set_bit()
-                .mps1()
-                .bits(config.max_packet_size)
-                .eptype1()
+        ep_out.doepctl().modify(|_, w| {
+            w.eptype()
                 .bits(config.ep_type as u8)
-                .do_setd0pid1()
+                .mps()
+                .bits(config.max_packet_size)
+                .usbactep()
                 .set_bit()
-            */
-            let bits = r.bits() & !0x300c07ff;
-            let (ep_type_bits, _) = (config.ep_type as u8).overflowing_shl(18);
-            let bits = bits
-                | (1 << 15)
-                | (ep_type_bits as u32)
-                | (config.max_packet_size as u32)
-                | (1 << 29);
-            unsafe { w.bits(bits) }
+                .setd0pid()
+                .set_bit()
         });
 
         // Enable interrupts for this endpoint
@@ -1433,11 +1479,15 @@ impl<'d> State<'d> {
     pub fn disable_in_ep(&mut self, ep_index: usize) {
         // TODO
         error!("TODO: disable IN EP{}", ep_index);
+        assert_ne!(ep_index, 0); // EP0 is always enabled
+        assert!(ep_index < NUM_IN_ENDPOINTS);
     }
 
     pub fn disable_out_ep(&mut self, ep_index: usize) {
         // The global OUT NAK flag must be set before disabling any OUT endpoint.
         self.set_global_out_nak();
+        assert_ne!(ep_index, 0); // EP0 is always enabled
+        assert!(ep_index < NUM_OUT_ENDPOINTS);
 
         // TODO
         error!("TODO: disable OUT EP{}", ep_index);
@@ -1447,10 +1497,18 @@ impl<'d> State<'d> {
     }
 
     pub fn stall_in_ep(&self, ep_index: usize) {
-        self.usb0
-            .in_ep(ep_index)
-            .diepctl()
-            .modify(|_, w| w.d_stall1().set_bit());
+        if ep_index == 0 {
+            self.usb0
+                .in_ep0()
+                .diepctl()
+                .modify(|_, w| w.stall().set_bit());
+        } else {
+            assert!(ep_index < NUM_IN_ENDPOINTS);
+            self.usb0
+                .in_ep(ep_index - 1)
+                .diepctl()
+                .modify(|_, w| w.stall().set_bit());
+        }
 
         // Note: the embassy-stm32 implementation wakes the endpoint waker here,
         // but this doesn't seem necessary here to me?  I don't see any place where polling code
@@ -1458,10 +1516,18 @@ impl<'d> State<'d> {
     }
 
     pub fn stall_out_ep(&self, ep_index: usize) {
-        self.usb0
-            .out_ep(ep_index)
-            .doepctl()
-            .modify(|_, w| w.stall1().set_bit());
+        if ep_index == 0 {
+            self.usb0
+                .out_ep0()
+                .doepctl()
+                .modify(|_, w| w.stall().set_bit());
+        } else {
+            assert!(ep_index < NUM_OUT_ENDPOINTS);
+            self.usb0
+                .out_ep(ep_index - 1)
+                .doepctl()
+                .modify(|_, w| w.stall().set_bit());
+        }
 
         // Note: the embassy-stm32 implementation wakes the endpoint waker here,
         // but this doesn't seem necessary here to me?  I don't see any place where polling code
@@ -1469,21 +1535,31 @@ impl<'d> State<'d> {
     }
 
     pub fn is_in_ep_stalled(&self, ep_index: usize) -> bool {
-        self.usb0
-            .in_ep(ep_index)
-            .diepctl()
-            .read()
-            .d_stall1()
-            .bit_is_set()
+        if ep_index == 0 {
+            self.usb0.in_ep0().diepctl().read().stall().bit_is_set()
+        } else {
+            assert!(ep_index < NUM_IN_ENDPOINTS);
+            self.usb0
+                .in_ep(ep_index - 1)
+                .diepctl()
+                .read()
+                .stall()
+                .bit_is_set()
+        }
     }
 
     pub fn is_out_ep_stalled(&self, ep_index: usize) -> bool {
-        self.usb0
-            .out_ep(ep_index)
-            .doepctl()
-            .read()
-            .stall1()
-            .bit_is_set()
+        if ep_index == 0 {
+            self.usb0.out_ep0().doepctl().read().stall().bit_is_set()
+        } else {
+            assert!(ep_index < NUM_OUT_ENDPOINTS);
+            self.usb0
+                .out_ep(ep_index)
+                .doepctl()
+                .read()
+                .stall()
+                .bit_is_set()
+        }
     }
 }
 
