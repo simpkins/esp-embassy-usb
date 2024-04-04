@@ -26,6 +26,7 @@ esp-hal = { version = "0.16.1", features = ["async", "embassy", "embassy-time-ti
 log = { version = "0.4.20" }
 esp-hal-procmacros = { version = "0.9.0", features = ["embassy"] }
 embassy-usb-driver = "0.1.0"
+embassy-usb = "0.1.0"
 futures = { version = "0.3.30", default-features = false }
 embassy-sync = "0.5.0"
 vcell = "0.1.3"
@@ -39,18 +40,15 @@ static_assertions = "1.1.0"
 esp32s2 = ["dep:esp32s2", "esp-hal/esp32s2"]
 esp32s3 = ["dep:esp32s3", "esp-hal/esp32s3"]
 
-# TODO: these patches are for development only, for using development versions
-# of these crates.  Delete them from a real release.
+# TODO: remove these patches once the changes are merged upstream
 [patch.crates-io]
-# A patch which includes https://github.com/twitchyliquid64/usbd-hid/pull/63
-usbd-hid-macros = { path = "../../src/usbd-hid/macros" }
-usbd-hid = { path = "../../src/usbd-hid" }
-# esp-pacs / esp-hal updates to include https://github.com/esp-rs/esp-pacs/pull/213
-esp32s3 = { path = "../../src/esp-pacs/esp32s3" }
-esp32s3-ulp = { path = "../../src/esp-pacs/esp32s3-ulp" }
-esp-hal = { path = "../../src/esp-hal/esp-hal" }
-esp-lp-hal = { path = "../../src/esp-hal/esp-lp-hal" }
-esp-hal-procmacros = { path = "../../src/esp-hal/esp-hal-procmacros" }
-# Just to let me add some extra debug statements during testing
-embassy-usb = { path = "../../src/embassy/embassy-usb" }
-embassy-usb-driver = { path = "../../src/embassy/embassy-usb-driver" }
+# Use the latest embassy code, needed so it depends on the lastest usbd-hid
+embassy-usb-driver = { git = "https://github.com/embassy-rs/embassy.git", rev = "067e4228" }
+embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", rev = "067e4228"  }
+# Use usbd-hid with https://github.com/twitchyliquid64/usbd-hid/pull/63
+usbd-hid-macros = { git = "https://github.com/simpkins/usbd-hid-rs.git", rev = "593e825" }
+usbd-hid = { git = "https://github.com/simpkins/usbd-hid-rs.git", rev = "593e825" }
+# Use a version of esp-hal that depends includes the esp-pacs change
+# https://github.com/esp-rs/esp-pacs/pull/213
+esp-hal = { git = "https://github.com/simpkins/esp-hal.git", rev = "2b8a710b" }
+esp-hal-procmacros = { git = "https://github.com/simpkins/esp-hal.git", rev = "2b8a710b" }

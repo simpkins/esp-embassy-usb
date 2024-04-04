@@ -456,7 +456,7 @@ impl<'d> State<'d> {
                 // disabled since we started our read attempt.
                 let out_ep = self.usb0.out_ep0();
                 let doepctl = out_ep.doepctl().read();
-                trace!("  EP0 doepctl: {:?}", doepctl);
+                trace!("  EP0 doepctl: 0x{:08x}", doepctl.bits());
                 if doepctl.naksts().bit_is_set() {
                     warn!("bus reset while attempting to read from EP0");
                     return Some(EndpointError::Disabled);
@@ -692,7 +692,7 @@ impl<'d> State<'d> {
         }
 
         let ints = self.usb0.gintsts().read();
-        trace!("USB poll bus: ints={:x} {:?}", ints.bits(), ints);
+        trace!("USB poll bus: ints=0x{:08x}", ints.bits());
 
         // Process RX FIFO events first, before bus reset events.
         // When first connecting to a device, Linux hosts tend to request the device descriptor,
