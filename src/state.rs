@@ -121,6 +121,7 @@ impl<'d> State<'d> {
 
     /// This performs the main logic for Bus::poll()
     pub fn poll_bus(&mut self, cx: &mut core::task::Context) -> Poll<Event> {
+        trace!("poll_bus starting");
         self.poll_usb(cx);
 
         if self.bus_event_flags == 0 {
@@ -333,7 +334,7 @@ impl<'d> State<'d> {
         cx: &mut core::task::Context,
         ep_index: usize,
     ) -> Poll<()> {
-        trace!("OUT EP{} poll polling for enabled", ep_index);
+        trace!("OUT EP{} polling for enabled", ep_index);
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
             self.poll_usb(cx);
