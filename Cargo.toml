@@ -7,6 +7,20 @@ edition = "2021"
 [workspace]
 members = ["examples"]
 
+[profile.release]
+opt-level = 3
+codegen-units = 1 # LLVM can perform better optimizations using a single thread
+debug = 2
+debug-assertions = false
+incremental = false
+lto = 'fat'
+overflow-checks = false
+
+[profile.dev]
+debug = true
+# Build with optimization even in debug builds.
+opt-level = 2
+
 [dependencies]
 esp-hal = { version = "0.16.1", features = ["async", "embassy", "embassy-time-timg0", "embassy-executor-thread"] }
 log = { version = "0.4.20" }

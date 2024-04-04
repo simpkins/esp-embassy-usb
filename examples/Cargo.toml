@@ -10,20 +10,6 @@ rust-version = "1.71"
 name = "hid_keyboard"
 target = "hid_keyboard.rs"
 
-[profile.release]
-opt-level = 3
-codegen-units = 1 # LLVM can perform better optimizations using a single thread
-debug = 2
-debug-assertions = false
-incremental = false
-lto = 'fat'
-overflow-checks = false
-
-[profile.dev]
-debug = true
-# Build with optimization even in debug builds.
-opt-level = 2
-
 [dependencies]
 esp-backtrace = { version = "0.11.0", features = [
     "exception-handler",
