@@ -164,9 +164,7 @@ impl<'d> State<'d> {
     }
 
     pub fn set_address(&mut self, address: u8) {
-        self.usb0
-            .dcfg()
-            .modify(|_, w| unsafe { w.devaddr().bits(address) });
+        self.usb0.dcfg().modify(|_, w| w.devaddr().bits(address));
     }
 
     pub fn init_bus(&mut self, fifo_settings: &FifoSettings) {
@@ -801,9 +799,7 @@ impl<'d> State<'d> {
         self.nak_all_out_endpoints();
 
         // Clear the device address
-        self.usb0
-            .dcfg()
-            .modify(|_, w| unsafe { w.devaddr().bits(0) });
+        self.usb0.dcfg().modify(|_, w| w.devaddr().bits(0));
 
         // Disable all endpoint interrupts
         self.usb0.daintmsk().write(|w| unsafe { w.bits(0) });
