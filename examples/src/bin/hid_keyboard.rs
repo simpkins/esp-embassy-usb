@@ -32,7 +32,12 @@ async fn main(_spawner: Spawner) {
     let timg0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
     esp_hal::embassy::init(&clocks, timg0);
 
-    let io = gpio::IO::new(peripherals.GPIO, peripherals.IO_MUX);
+    let io = gpio::IO::new_with_priority(
+        peripherals.GPIO,
+        peripherals.IO_MUX,
+        esp_hal::interrupt::Priority::Priority1,
+    );
+
     let config = UsbConfig::default();
     log::info!("creating usb driver");
     let mut state = State::new(
@@ -96,12 +101,14 @@ async fn main(_spawner: Spawner) {
 
     let (reader, mut writer) = hid.split();
 
-    let mut button = io.pins.gpio0.into_pull_down_input();
+    // GPIO 0 is connected to the boot button on ESP32 dev kits.
+    // It is normally pulled high, and pressing the boot switch pulls it low.
+    let mut button = io.pins.gpio0.into_floating_input();
 
     // Do stuff with the class!
     let in_fut = async {
         loop {
-            let _ = button.wait_for_rising_edge().await;
+            let _ = button.wait_for_falling_edge().await;
             log::info!("Button pressed!");
             // Create a report with the A key pressed. (no shift modifier)
             let report = KeyboardReport {
@@ -116,7 +123,7 @@ async fn main(_spawner: Spawner) {
                 Err(e) => log::warn!("Failed to send report: {:?}", e),
             };
 
-            let _ = button.wait_for_falling_edge().await;
+            let _ = button.wait_for_rising_edge().await;
             log::info!("Button released!");
             let report = KeyboardReport {
                 keycodes: [0, 0, 0, 0, 0, 0],
@@ -234,7 +241,15 @@ impl log::Log for TimestampLogger {
         let timestamp = embassy_time::Instant::now();
         let s = timestamp.as_secs();
         let ms = timestamp.as_millis() % 1000;
-        println!("{}{}.{:03}: {} - {}{}", color, s, ms, record.level(), record.args(), RESET);
+        println!(
+            "{}{}.{:03}: {} - {}{}",
+            color,
+            s,
+            ms,
+            record.level(),
+            record.args(),
+            RESET
+        );
     }
 
     fn flush(&self) {}
