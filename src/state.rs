@@ -1,6 +1,7 @@
 use crate::driver::FifoSettings;
 use crate::Config;
 use core::cell::RefCell;
+use core::future::poll_fn;
 use core::task::Poll;
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::{EndpointError, EndpointType, Event};
@@ -1565,7 +1566,7 @@ pub(crate) async fn start_read_op<'b, 'd>(
     ep_index: usize,
     buf: &'b mut [u8],
 ) -> Result<ReadOperation<'b, 'd>, EndpointError> {
-    futures::future::poll_fn(|cx| {
+    poll_fn(|cx| {
         let mut state = state.borrow_mut();
         state.poll_out_ep_start_read(cx, ep_index, buf)
     })
@@ -1590,7 +1591,7 @@ pub(crate) struct ReadOperation<'b, 'd> {
 
 impl<'b, 'd> ReadOperation<'b, 'd> {
     pub(crate) async fn do_read(&mut self) -> Result<usize, EndpointError> {
-        futures::future::poll_fn(|cx| {
+        poll_fn(|cx| {
             let mut state = self.state.borrow_mut();
             state.poll_out_ep_read_complete(cx, self.ep_index)
         })

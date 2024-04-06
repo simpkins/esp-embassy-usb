@@ -1,12 +1,12 @@
 use crate::endpoint::{EndpointIn, EndpointOut};
 use crate::state::State;
 use core::cell::RefCell;
+use core::future::poll_fn;
 use embassy_usb_driver::{EndpointError, EndpointIn as _, EndpointOut as _};
-use futures::future::poll_fn;
 use log::trace;
 
 pub struct ControlPipe<'d> {
-    state: &'d RefCell<State<'d>>,  // TODO: remove this and access ep_in.state instead?
+    state: &'d RefCell<State<'d>>, // TODO: remove this and access ep_in.state instead?
     max_packet_size: u16,
     ep_in: EndpointIn<'d>,
     ep_out: EndpointOut<'d>,

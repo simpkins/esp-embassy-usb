@@ -1,7 +1,7 @@
 use crate::state::State;
 use core::cell::RefCell;
 use embassy_usb_driver::{Direction, EndpointAddress, EndpointError, EndpointInfo, EndpointType};
-use futures::future::poll_fn; // TODO: switch to core::future::poll_fn?
+use core::future::poll_fn;
 use log::trace;
 
 pub struct EndpointIn<'d> {
