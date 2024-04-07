@@ -664,8 +664,8 @@ impl<'d> State<'d> {
                 .set_bit()
                 .iepintmsk()
                 .set_bit()
-            // .oepintmsk()
-            // .set_bit()
+                .oepintmsk()
+                .set_bit()
         });
     }
 
@@ -784,9 +784,6 @@ impl<'d> State<'d> {
             self.record_bus_event(Event::Resume);
         }
 
-        // We don't currently register for OUT endpoint interrupts.
-        // Maybe we will need to in the future if we wanted to fix the busy loop in
-        // stop_all_out_endpoints(), and wait for the endpoint disable interrupt.
         if ints.oepint().bit() {
             self.process_out_ep_interrupts();
         }
