@@ -23,7 +23,6 @@ pub(crate) struct State<'d> {
     config: Config,
     ep0_mps_bits: u8,
     bus_event_flags: u8,
-    initialized: bool,
     ep0_setup_ready: bool,
     ep0_setup_data: [u32; 2],
 
@@ -75,12 +74,19 @@ impl<'d> State<'d> {
     // the Peripheral to a PeripheralRef first in order to let esp_hal::otg_fs::USB initialize
     // the USB peripheral clock.
     pub fn new(usb0: PeripheralRef<'d, USB0>, config: Config) -> Self {
+        // If we do not have a VBUS detection pin, start with a PowerDetected event recorded
+        // so that we will return this the very first time poll_bus() is called.
+        let bus_event_flags = if let None = config.vbus_detection_pin {
+            bus_event_flag::POWER_DETECTED
+        } else {
+            0
+        };
+
         Self {
             usb0: usb0,
             config,
             ep0_mps_bits: 0,
-            bus_event_flags: 0,
-            initialized: false,
+            bus_event_flags,
             ep0_setup_data: [0; 2],
             ep0_setup_ready: false,
             ep_in_config: [None; NUM_IN_ENDPOINTS],
@@ -682,16 +688,6 @@ impl<'d> State<'d> {
     }
 
     fn process_interrupts(&mut self) {
-        if !self.initialized {
-            self.initialized = true;
-
-            // If we don't have a dedicated pin to detect VBUS,
-            // return a PowerDetected event immediately on startup.
-            if let None = self.config.vbus_detection_pin {
-                self.record_bus_event(Event::PowerDetected);
-            }
-        }
-
         let ints = self.usb0.gintsts().read();
         trace!("USB poll bus: ints=0x{:08x}", ints.bits());
 
