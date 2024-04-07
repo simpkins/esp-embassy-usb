@@ -1,11 +1,11 @@
-use crate::driver::FifoSettings;
+use crate::driver::FifoSizes;
 use crate::fmt::{error, trace, warn};
 use crate::Config;
 use core::cell::RefCell;
 use core::future::poll_fn;
 use core::task::Poll;
 use embassy_sync::waitqueue::AtomicWaker;
-use embassy_usb_driver::{EndpointError, EndpointType, Event};
+use embassy_usb_driver::{EndpointAllocError, EndpointError, EndpointType, Event};
 use esp_hal::peripheral::PeripheralRef;
 use esp_hal::peripherals::{Interrupt, USB0};
 
@@ -26,9 +26,8 @@ pub(crate) struct State<'d> {
     ep0_setup_ready: bool,
     ep0_setup_data: [u32; 2],
 
-    // TODO: move the endpoint allocation code into State, and drop the pub(crate) attributes here
-    pub(crate) ep_in_config: [Option<InEndpointConfig>; NUM_IN_ENDPOINTS],
-    pub(crate) ep_out_config: [Option<OutEndpointConfig>; NUM_OUT_ENDPOINTS],
+    ep_in_config: [Option<InEndpointConfig>; NUM_IN_ENDPOINTS],
+    ep_out_config: [Option<OutEndpointConfig>; NUM_OUT_ENDPOINTS],
 
     ep_in_waker: [AtomicWaker; NUM_IN_ENDPOINTS],
     ep_out_waker: [AtomicWaker; NUM_OUT_ENDPOINTS],
@@ -82,7 +81,7 @@ impl<'d> State<'d> {
             0
         };
 
-        Self {
+        let mut state = Self {
             usb0: usb0,
             config,
             ep0_mps_bits: 0,
@@ -94,7 +93,22 @@ impl<'d> State<'d> {
             ep_in_waker: core::array::from_fn(|_| AtomicWaker::new()),
             ep_out_waker: core::array::from_fn(|_| AtomicWaker::new()),
             ep_out_readers: core::array::from_fn(|_| ReadBuf::new()),
-        }
+        };
+
+        // Endpoint 0 always exists.
+        // We set max_packet_size to 64 here, but this may be updated later in Driver::start() with
+        // a call to set_ep0_max_packet_size().
+        state.ep_in_config[0] = Some(InEndpointConfig {
+            ep_type: EndpointType::Control,
+            tx_fifo: 0,
+            max_packet_size: 64,
+        });
+        state.ep_out_config[0] = Some(OutEndpointConfig {
+            ep_type: EndpointType::Control,
+            max_packet_size: 64,
+        });
+
+        state
     }
 
     /// The main USB worker function.
@@ -167,6 +181,12 @@ impl<'d> State<'d> {
                 return Err(InvalidControlMaxPacketSize);
             }
         };
+        if let Some(config) = &mut self.ep_in_config[0] {
+            config.max_packet_size = max_packet_size;
+        }
+        if let Some(config) = &mut self.ep_out_config[0] {
+            config.max_packet_size = max_packet_size;
+        }
         Ok(())
     }
 
@@ -174,7 +194,7 @@ impl<'d> State<'d> {
         self.usb0.dcfg().modify(|_, w| w.devaddr().bits(address));
     }
 
-    pub fn init_bus(&mut self, fifo_settings: &FifoSettings) {
+    pub fn init_bus(&mut self, fifo_settings: &FifoSizes) {
         // Ensure the data line pull-up is disabled as we perform initialization.
         self.usb0.dctl().modify(|_, w| w.sftdiscon().set_bit());
 
@@ -265,7 +285,39 @@ impl<'d> State<'d> {
         self.usb0.dctl().modify(|_, w| w.sftdiscon().clear_bit());
     }
 
-    fn init_fifos(&mut self, settings: &FifoSettings) {
+    pub(crate) fn alloc_in_endpoint(
+        &mut self,
+        config: InEndpointConfig,
+    ) -> Result<usize, EndpointAllocError> {
+        let ep_index = self.find_free_endpoint_slot(&self.ep_in_config)?;
+        self.ep_in_config[ep_index] = Some(config);
+        Ok(ep_index)
+    }
+
+    pub(crate) fn alloc_out_endpoint(
+        &mut self,
+        config: OutEndpointConfig,
+    ) -> Result<usize, EndpointAllocError> {
+        let ep_index = self.find_free_endpoint_slot(&self.ep_out_config)?;
+        self.ep_out_config[ep_index] = Some(config);
+        Ok(ep_index)
+    }
+
+    fn find_free_endpoint_slot<Slot>(
+        &self,
+        slots: &[Option<Slot>],
+    ) -> Result<usize, EndpointAllocError> {
+        for (index, ep) in slots.iter().enumerate() {
+            if ep.is_none() {
+                trace!("allocating endpoint {}", index);
+                return Ok(index);
+            }
+        }
+        error!("No free endpoints available");
+        return Err(EndpointAllocError);
+    }
+
+    fn init_fifos(&mut self, sizes: &FifoSizes) {
         // Sanity check that things aren't currently in use
         assert!(
             {
@@ -274,7 +326,7 @@ impl<'d> State<'d> {
             },
             "init_fifos() called after EP0 has already been configured"
         );
-        trace!("init_fifos: {:?}", settings);
+        trace!("init_fifos: {:?}", sizes);
 
         // Note: during initialization we assume that the USB bus has not been used yet,
         // so the USB core should not be currently accessing the RX or TX FIFOs.
@@ -284,9 +336,9 @@ impl<'d> State<'d> {
         // Configure the RX FIFO size
         self.usb0
             .grxfsiz()
-            .write(|w| unsafe { w.rxfdep().bits(settings.rx_num_words) });
+            .write(|w| unsafe { w.rxfdep().bits(sizes.rx_num_words) });
 
-        let mut offset_words = settings.rx_num_words;
+        let mut offset_words = sizes.rx_num_words;
 
         // Configure TX FIFOs
         // TX FIFO 0 is configured with usb0.gnptxfsiz()
@@ -294,9 +346,9 @@ impl<'d> State<'d> {
             w.nptxfstaddr()
                 .bits(offset_words)
                 .nptxfdep()
-                .bits(settings.tx_num_words[0])
+                .bits(sizes.tx_num_words[0])
         });
-        offset_words += settings.tx_num_words[0];
+        offset_words += sizes.tx_num_words[0];
 
         // TX FIFOs 1-4 are configured with usb0.dieptxfN
         for n in 0..4 {
@@ -304,9 +356,9 @@ impl<'d> State<'d> {
                 w.inep1txfstaddr()
                     .bits(offset_words)
                     .inep1txfdep()
-                    .bits(settings.tx_num_words[n + 1])
+                    .bits(sizes.tx_num_words[n + 1])
             });
-            offset_words = offset_words + settings.tx_num_words[0];
+            offset_words = offset_words + sizes.tx_num_words[0];
         }
     }
 
@@ -551,7 +603,6 @@ impl<'d> State<'d> {
         &mut self,
         cx: &mut core::task::Context,
         ep_index: usize,
-        fifo_index: usize,
         buf: &[u8],
     ) -> Poll<Result<(), EndpointError>> {
         trace!("IN EP{} TX: polling for write", ep_index);
@@ -561,6 +612,14 @@ impl<'d> State<'d> {
         }
 
         self.ep_in_waker[ep_index].register(cx.waker());
+
+        let fifo_index = match self.ep_in_config[ep_index] {
+            Some(cfg) => cfg.tx_fifo,
+            None => {
+                // shouldn't happen unless there is a bug.
+                return Poll::Ready(Err(EndpointError::Disabled));
+            }
+        };
 
         let dtxfsts = if ep_index == 0 {
             let ep_regs = self.usb0.in_ep0();
@@ -1044,12 +1103,12 @@ impl<'d> State<'d> {
         }
     }
 
-    fn write_to_fifo(&mut self, buf: &[u8], fifo_index: usize) {
+    fn write_to_fifo(&mut self, buf: &[u8], fifo_index: u8) {
         // TODO: it would be nicer to use DMA for reads and writes, but I haven't seen much
         // documentation on how to do DMA transfers to the USB core.   I've seen posts in the
         // Espressif forum that they plan to implement DMA transfers in the tinyusb code at some
         // point, so we could look at their implementation once that is complete.
-        let fifo = self.usb0.fifo(fifo_index);
+        let fifo = self.usb0.fifo(fifo_index as usize);
         let whole_words = buf.len() / 4;
         if whole_words > 0 {
             // We could check buf.as_ptr().is_aligned_to(4), but this is nightly-only
@@ -1403,8 +1462,6 @@ impl<'d> State<'d> {
         assert!(ep_index < NUM_IN_ENDPOINTS);
         let ep_in = self.usb0.in_ep(ep_index - 1);
 
-        // We currently always assign each IN endpoint to the TX FIFO with the same number.
-        let fifo_num = ep_index as u8;
         let config = match self.ep_in_config[ep_index] {
             None => {
                 // This endpoint isn't configured.
@@ -1421,7 +1478,7 @@ impl<'d> State<'d> {
                     .eptype()
                     .bits(config.ep_type as u8)
                     .txfnum()
-                    .bits(fifo_num)
+                    .bits(config.tx_fifo)
             }
             .usbactep()
             .set_bit()
@@ -1760,6 +1817,7 @@ mod devspd {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InEndpointConfig {
     pub(crate) ep_type: EndpointType,
+    pub(crate) tx_fifo: u8,
     pub(crate) max_packet_size: u16,
 }
 

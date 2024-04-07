@@ -40,10 +40,6 @@ impl<'d> EndpointIn<'d> {
     pub(crate) fn max_packet_size(&self) -> u16 {
         self.info.max_packet_size
     }
-
-    pub(crate) fn index(&self) -> usize {
-        self.info.addr.index()
-    }
 }
 
 impl<'d> EndpointOut<'d> {
@@ -63,10 +59,6 @@ impl<'d> EndpointOut<'d> {
                 interval_ms,
             },
         }
-    }
-
-    pub(crate) fn index(&self) -> usize {
-        self.info.addr.index()
     }
 }
 
@@ -142,21 +134,12 @@ impl<'d> embassy_usb_driver::EndpointIn for EndpointIn<'d> {
             return Err(EndpointError::BufferOverflow);
         }
 
-        // The driver currently always assigns each IN endpoint to the TX FIFO with the same
-        // number.
-        let fifo_index = ep_index;
-
         // This waits until the endpoint is free (in case an existing transfer is already in
         // progress) and for there to be enough room in the TX FIFO, and then transmits the packet.
         //
         // Note that if there a multiple outstanding calls to EndpointIn::write(),
         // they will both wait for the endpoint to be free and it is undefined which
         // one will win and get to go first.
-        poll_fn(|cx| {
-            self.state
-                .borrow_mut()
-                .poll_in_ep_write(cx, ep_index, fifo_index, buf)
-        })
-        .await
+        poll_fn(|cx| self.state.borrow_mut().poll_in_ep_write(cx, ep_index, buf)).await
     }
 }
