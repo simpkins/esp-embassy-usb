@@ -6,12 +6,12 @@ use log::trace;
 
 pub struct EndpointIn<'d> {
     state: &'d RefCell<State<'d>>,
-    pub(crate) info: EndpointInfo,
+    info: EndpointInfo,
 }
 
 pub struct EndpointOut<'d> {
     state: &'d RefCell<State<'d>>,
-    pub(crate) info: EndpointInfo,
+    info: EndpointInfo,
 }
 
 impl<'d> EndpointIn<'d> {
@@ -32,6 +32,18 @@ impl<'d> EndpointIn<'d> {
             },
         }
     }
+
+    pub(crate) fn state(&self) -> &'d RefCell<State<'d>> {
+        self.state
+    }
+
+    pub(crate) fn max_packet_size(&self) -> u16 {
+        self.info.max_packet_size
+    }
+
+    pub(crate) fn index(&self) -> usize {
+        self.info.addr.index()
+    }
 }
 
 impl<'d> EndpointOut<'d> {
@@ -51,6 +63,10 @@ impl<'d> EndpointOut<'d> {
                 interval_ms,
             },
         }
+    }
+
+    pub(crate) fn index(&self) -> usize {
+        self.info.addr.index()
     }
 }
 

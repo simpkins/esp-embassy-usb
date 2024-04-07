@@ -67,7 +67,7 @@ impl FifoSettings {
         fifo_index: usize,
         max_packet_size: u16,
     ) -> Result<(), EndpointAllocError> {
-        // INEPTXFD requires minimum size of 16 words
+        // DIEPTXF requires a minimum size of 16 words
         let minimum_fifo_size_words = u16::max((max_packet_size + 3) / 4, 16);
         if self.allocated_num_words() + minimum_fifo_size_words > FIFO_DEPTH_WORDS {
             // We do not have enough space in the FIFO
@@ -257,8 +257,8 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
         let ep0_in = self
             .alloc_endpoint_in(EndpointType::Control, control_max_packet_size, 0)
             .unwrap();
-        assert_eq!(ep0_out.info.addr.index(), 0);
-        assert_eq!(ep0_in.info.addr.index(), 0);
+        assert_eq!(ep0_out.index(), 0);
+        assert_eq!(ep0_in.index(), 0);
 
         {
             let mut state = self.state.borrow_mut();
@@ -276,7 +276,7 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
 
         (
             Bus::new(self.state),
-            ControlPipe::new(self.state, control_max_packet_size, ep0_in, ep0_out),
+            ControlPipe::new(ep0_in, ep0_out),
         )
     }
 }
