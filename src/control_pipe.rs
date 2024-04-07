@@ -1,9 +1,9 @@
 use crate::endpoint::{EndpointIn, EndpointOut};
+use crate::fmt::*;
 use crate::state::State;
 use core::cell::RefCell;
 use core::future::poll_fn;
 use embassy_usb_driver::{EndpointError, EndpointIn as _, EndpointOut as _};
-use log::trace;
 
 pub struct ControlPipe<'d> {
     ep_in: EndpointIn<'d>,
@@ -11,14 +11,8 @@ pub struct ControlPipe<'d> {
 }
 
 impl<'d> ControlPipe<'d> {
-    pub(crate) fn new(
-        ep_in: EndpointIn<'d>,
-        ep_out: EndpointOut<'d>,
-    ) -> Self {
-        Self {
-            ep_in,
-            ep_out,
-        }
+    pub(crate) fn new(ep_in: EndpointIn<'d>, ep_out: EndpointOut<'d>) -> Self {
+        Self { ep_in, ep_out }
     }
 
     fn state(&self) -> &'d RefCell<State<'d>> {

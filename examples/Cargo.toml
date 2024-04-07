@@ -23,7 +23,7 @@ embassy-executor = { version = "0.5.0", features = ["nightly", "integrated-timer
 esp-hal-procmacros = { version = "0.9.0", features = ["embassy"] }
 embassy-futures = "0.1.1"
 embassy-usb = { version = "0.1.0", features = ["max-interface-count-1", "max-handler-count-2", "log"] }
-esp-embassy-usb = { path = ".." }
+esp-embassy-usb = { path = "..", features = ["log"] }
 usbd-hid = "0.7.0"
 embedded-hal-async = "1.0.0"
 embassy-time = "0.3.0"

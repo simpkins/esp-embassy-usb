@@ -1,7 +1,7 @@
+use crate::fmt::trace;
 use crate::state::BUS_WAKER;
 use esp_hal::peripherals::USB0;
 use esp_hal_procmacros::interrupt;
-use log::trace;
 
 /// The USB interrupt handler.
 ///

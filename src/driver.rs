@@ -1,10 +1,10 @@
 use crate::bus::Bus;
 use crate::control_pipe::ControlPipe;
 use crate::endpoint::{EndpointIn, EndpointOut};
+use crate::fmt::{error, trace};
 use crate::state::{InEndpointConfig, OutEndpointConfig, State};
 use core::cell::RefCell;
 use embassy_usb_driver::{EndpointAllocError, EndpointType};
-use log::{error, trace};
 
 pub struct Driver<'d> {
     state: &'d RefCell<State<'d>>,
@@ -274,9 +274,6 @@ impl<'d> embassy_usb_driver::Driver<'d> for Driver<'d> {
             state.init_bus(&self.fifo_settings);
         }
 
-        (
-            Bus::new(self.state),
-            ControlPipe::new(ep0_in, ep0_out),
-        )
+        (Bus::new(self.state), ControlPipe::new(ep0_in, ep0_out))
     }
 }

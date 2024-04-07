@@ -1,4 +1,5 @@
 use crate::driver::FifoSettings;
+use crate::fmt::{error, trace, warn};
 use crate::Config;
 use core::cell::RefCell;
 use core::future::poll_fn;
@@ -7,7 +8,6 @@ use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::{EndpointError, EndpointType, Event};
 use esp_hal::peripheral::PeripheralRef;
 use esp_hal::peripherals::{Interrupt, USB0};
-use log::{error, trace, warn};
 
 pub const NUM_IN_ENDPOINTS: usize = 7;
 pub const NUM_OUT_ENDPOINTS: usize = 7;

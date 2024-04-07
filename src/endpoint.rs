@@ -1,8 +1,8 @@
+use crate::fmt::trace;
 use crate::state::State;
 use core::cell::RefCell;
-use embassy_usb_driver::{Direction, EndpointAddress, EndpointError, EndpointInfo, EndpointType};
 use core::future::poll_fn;
-use log::trace;
+use embassy_usb_driver::{Direction, EndpointAddress, EndpointError, EndpointInfo, EndpointType};
 
 pub struct EndpointIn<'d> {
     state: &'d RefCell<State<'d>>,
