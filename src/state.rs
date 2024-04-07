@@ -833,11 +833,10 @@ impl<'d> State<'d> {
         }
 
         // Note: we don't change the FIFO configuration (grxfsiz, gnptxfsiz, dieptxf1, etc.)
-        // This is set initially during Driver::start(), and embassy-usb doesn't allow changing
-        // endpoint config after start() we never need to update the FIFO configuration.
+        // This is set initially during Driver::start(), and since embassy-usb doesn't allow
+        // changing endpoint config after start() we never need to update the FIFO configuration.
 
         // Re-enable receipt of SETUP and XFER complete endpoint interrupts
-
         self.usb0
             .daintmsk()
             .modify(|_, w| w.outepmsk0().set_bit().inepmsk0().set_bit());
@@ -910,25 +909,15 @@ impl<'d> State<'d> {
                 pktsts::SETUP_DONE => {
                     trace!("SETUP done");
                     // This entry indicates that the host has sent an IN or OUT token to start the
-                    // DATA phase of a control transfer.  Process the most recently seen SETUP
-                    // packet now, as we know this SETUP packet is valid for this transfer and is
-                    // not going to be superceded by another retransmitted SETUP.
+                    // DATA phase of a control transfer.  We know that the most recently seen SETUP
+                    // packet is valid for this transfer, and is not going to be superseded by
+                    // another retransmitted SETUP.
                     //
-                    // Note: the STMicro docs recommend doing nothing here, and waiting until we
-                    // get the stuppktrcvd OUT endpoint interrupt to process the packet.  It's not
-                    // clear to me if there is any reason to wait until the interrupt.  Other
-                    // driver implementations also appear to process the SETUP packet here with no
-                    // repercussions.  Doing the processing here lets us avoid needing to enable
-                    // OUT endpoint interrupts.
-                    //
-                    // Note that we do have to process the stuppktrcvd interrupt and clear this
-                    // interrupt flag, otherwise no new SETUP_DONE events will be delivered to the
-                    // RX FIFO until it is cleared.
-                    let ep_index = ctrl_word.chnum().bits();
-                    if ep_index == 0 {
-                        self.ep0_setup_ready = true;
-                        self.ep_out_waker[0].wake();
-                    }
+                    // When we pop the SETUP_DONE packet the USB core will automatically generate a
+                    // stuppktrcvd OUT endpoint interrupt.  We don't do any other processing here,
+                    // and we wait to deliver the SETUP packet to the embassy-usb code until we
+                    // process the stuppktrcvd interrupt.  This is the behavior recommended by the
+                    // STMicro docs.
                 }
                 pktsts::SETUP_RECEIVED => {
                     let ep_index = ctrl_word.chnum().bits();
@@ -1106,28 +1095,23 @@ impl<'d> State<'d> {
         let ints = doepint.read();
         trace!("interrupt on OUT EP{}: {:#x}", ep_index, ints.bits());
 
-        doepint.write(|w| {
-            w.setup()
-                .set_bit()
-                .stuppktrcvd()
-                .set_bit()
-                .xfercompl()
-                .set_bit()
-        });
-
-        if ints.stuppktrcvd().bit() {
-            trace!("process setup received");
-            // We don't do any work here, but we have to clear the interrupt bit
-            // so that the USB core will generate a SETUP done event for the next transaction
-            // following this one.
-            /*
+        if ints.setup().bit() {
+            trace!("process setup phase done");
+            doepint.write(|w| w.setup().set_bit());
             // We only configure EP0 as a control endpoint, so we don't expect to get SETUP packets
             // on any other endpoint, unless maybe the host is buggy?
             if ep_index == 0 {
                 self.ep0_setup_ready = true;
                 self.ep_out_waker[0].wake();
             }
-            */
+        }
+
+        if ints.xfercompl().bit_is_set() {
+            trace!("RX complete on EP{}", ep_index);
+            doepint.write(|w| w.xfercompl().set_bit());
+            // Note: at the moment we don't do any processing of the xfercompl interrupt,
+            // but we will need to perform processing here in the future if we want to support
+            // reading more than 1 packet at a time.
         }
     }
 
@@ -1151,15 +1135,13 @@ impl<'d> State<'d> {
         let ints = diepint.read();
         trace!("interrupt on IN EP{}: {:#x}", ep_index, ints.bits());
 
-        // Clear all interrupts that we process
-        // Note that txfemp is read-only, and will always be asserted when the FIFO is empty.
-        diepint.write(|w| w.xfercompl().set_bit().timeout().set_bit());
-
         // If the TX FIFO is empty, disable this interrupt for this endpoint and then wake
         // any endpoint handling code that may be pending.  (In particular, poll_in_ep_transmit()
         // cares about this if it is pending.)
         if ints.txfemp().bit_is_set() {
             trace!("TX FIFO empty on EP{}", ep_index);
+            // Note that we don't need to clear the txfemp bit in diepint.
+            // This bit is read-only, and is always asserted when the TX FIFO is empty.
             self.usb0.diepempmsk().modify(|r, w| {
                 let new_bits = r.d_ineptxfempmsk().bits() & !(1 << ep_index);
                 unsafe { w.d_ineptxfempmsk().bits(new_bits) }
@@ -1170,6 +1152,7 @@ impl<'d> State<'d> {
         // if a timeout occurs attempting to send an IN token.
         if ints.timeout().bit_is_set() {
             warn!("IN transaction timeout on EP{}", ep_index);
+            diepint.write(|w| w.timeout().set_bit());
 
             // TODO: we probably should flush the TX FIFO after a timeout.
             // We would need to:
@@ -1187,6 +1170,10 @@ impl<'d> State<'d> {
         }
         if ints.xfercompl().bit_is_set() {
             trace!("TX complete on EP{}", ep_index);
+            diepint.write(|w| w.xfercompl().set_bit());
+            // Note: at the moment we don't do any processing of the xfercompl interrupt,
+            // but we will need to perform processing here in the future if we want to support
+            // writing more than 1 packet at a time.
         }
 
         // Wake the ep_in_waker on any endpoint IN interrupt.

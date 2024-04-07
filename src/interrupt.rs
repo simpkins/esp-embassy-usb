@@ -5,10 +5,16 @@ use esp_hal_procmacros::interrupt;
 
 /// The USB interrupt handler.
 ///
-/// We do as little work here as possible, and only signal the BUS_WAKER.
-/// Any state accesses inside the interrupt handler would require manual critical sections here and
-/// in any other normal task code that accesses the same state.  Therefore we prefer to avoid doing
-/// work here and only access state from a normal embassy task.
+/// We do as little work here as possible, and only signal the BUS_WAKER.  This allows us to avoid
+/// needing any manual critical sections when accessing USB0 registers or our State object, as all
+/// modifications (apart from clearing gintmsk) are always done from a normal task and never in
+/// interrupt context.
+///
+/// That said, a downside of this approach is that it may add latency to USB event processing,
+/// since we have to wait for our embassy-usb task to wake up and run in order to process the
+/// events.  If we decide it is necessary for performance, we could move some processing into this
+/// interrupt handler, at the expense of requiring critical sections around some of the USB
+/// register access and around our own state data structures.
 #[interrupt]
 fn USB() {
     // Safety: this code assumes that the interrupt handler and main USB task code run on the same
