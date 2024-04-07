@@ -648,6 +648,7 @@ impl<'d> State<'d> {
         Poll::Ready(Ok(()))
     }
 
+    #[inline(always)]
     fn enable_intmask(&mut self) {
         self.usb0.gintmsk().write(|w| {
             w.modemismsk()
@@ -690,6 +691,27 @@ impl<'d> State<'d> {
     fn process_interrupts(&mut self) {
         let ints = self.usb0.gintsts().read();
         trace!("USB poll bus: ints=0x{:08x}", ints.bits());
+
+        // Fast path check for when there is nothing to do.
+        // Embassy can unfortunately call poll() more often than it needs to, even when our waker
+        // was never asked to wake up.  (The embassy select* APIs poll all pending futures on all
+        // branches any time any future is woken up.)  Therefore we want to make the no-op path
+        // fast.  The compiler should be smart enough to optimize this to a single u32 comparison.
+        if !(ints.rxflvi().bit_is_set()
+            || ints.modemis().bit_is_set()
+            || ints.sessreqint().bit_is_set()
+            || ints.erlysusp().bit_is_set()
+            || ints.otgint().bit_is_set()
+            || ints.usbrst().bit_is_set()
+            || ints.resetdet().bit_is_set()
+            || ints.enumdone().bit_is_set()
+            || ints.usbsusp().bit_is_set()
+            || ints.wkupint().bit_is_set()
+            || ints.oepint().bit_is_set()
+            || ints.iepint().bit_is_set())
+        {
+            return;
+        }
 
         // Process RX FIFO events first, before bus reset events.
         // When first connecting to a device, Linux hosts tend to request the device descriptor,
