@@ -198,8 +198,8 @@ impl<'d> State<'d> {
         // Ensure the data line pull-up is disabled as we perform initialization.
         self.usb0.dctl().modify(|_, w| w.sftdiscon().set_bit());
 
-        // Set the speed, and also configure the device to send a stall on receipt of any
-        // non-zero length OUT packet while we are still initializing the settings.
+        // Set the speed.  Also configure the device to send a stall on receipt of any
+        // unexpected non-zero length OUT packet during the status phase of a control transfer.
         self.usb0.dcfg().modify(|_, w| {
             unsafe { w.bits(devspd::FULL_48MHZ) }
                 .nzstsouthshk()
@@ -272,14 +272,6 @@ impl<'d> State<'d> {
         // Enable the interrupt handler
         esp_hal::interrupt::enable(Interrupt::USB, esp_hal::interrupt::Priority::Priority1)
             .expect("failed to enable USB interrupt");
-
-        // TODO: test enabling this code and see if it speeds up the enumeration process
-        /*
-        // Accept out packets.
-        // (Unclear if we really need to do this: tinyusb doesn't, and the STmicro docs don't really
-        // mention clearing it.)
-        self.usb0.dcfg().modify(|_, w| w.nzstsouthshk().clear_bit());
-        */
 
         // Enable the data line pull-up to connect the bus
         self.usb0.dctl().modify(|_, w| w.sftdiscon().clear_bit());
