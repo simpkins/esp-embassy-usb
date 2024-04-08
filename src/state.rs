@@ -465,6 +465,9 @@ impl<'d> State<'d> {
                     .bits(NUM_PACKETS as u16)
             });
             // Clear the NAK flag and enable endpoint to allow the hardware to start reading.
+            //
+            // TODO: For isochronous endpoints with interval == 1 I believe we need to manually set
+            // doepctl.setd0pid or doepctl.setd1pid.
             out_ep
                 .doepctl()
                 .modify(|_, w| w.cnak().set_bit().epena().set_bit());
@@ -687,7 +690,7 @@ impl<'d> State<'d> {
                     .xfersize()
                     .bits(buf.len() as u32)
             });
-            // TODO: For isochronous endpoints I believe we need to manually set
+            // TODO: For isochronous endpoints with interval == 1 I believe we need to manually set
             // diepctl.setd0pid or diepctl.setd1pid.
             ep_regs
                 .diepctl()
@@ -1473,9 +1476,11 @@ impl<'d> State<'d> {
                     .bits(config.tx_fifo)
             }
             .usbactep()
-            .set_bit()
-            .setd0pid()
-            .set_bit()
+            .set_bit();
+            if config.ep_type != EndpointType::Isochronous {
+                w.setd0pid().set_bit();
+            }
+            w
         });
 
         // Enable interrupts for this endpoint
@@ -1510,9 +1515,11 @@ impl<'d> State<'d> {
                 .mps()
                 .bits(config.max_packet_size)
                 .usbactep()
-                .set_bit()
-                .setd0pid()
-                .set_bit()
+                .set_bit();
+            if config.ep_type != EndpointType::Isochronous {
+                w.setd0pid().set_bit();
+            }
+            w
         });
 
         // Enable interrupts for this endpoint
