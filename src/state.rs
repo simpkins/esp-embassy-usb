@@ -2,7 +2,7 @@ use crate::driver::FifoSizes;
 use crate::fmt::{error, trace, warn};
 use crate::Config;
 use core::cell::RefCell;
-use core::future::poll_fn;
+use core::pin::Pin;
 use core::task::Poll;
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::{EndpointAllocError, EndpointError, EndpointType, Event};
@@ -32,9 +32,9 @@ pub(crate) struct State<'d> {
     ep_in_waker: [AtomicWaker; NUM_IN_ENDPOINTS],
     ep_out_waker: [AtomicWaker; NUM_OUT_ENDPOINTS],
 
-    // A list of current read buffers.
-    // These are populated only while a read is actively occurring on an endpoint
-    ep_out_readers: [ReadBuf; NUM_OUT_ENDPOINTS],
+    // A list of in-progress read operations.
+    // These are populated only while a read is actively occurring on an endpoint.
+    ep_out_readers: [ReadOpPtr<'d>; NUM_OUT_ENDPOINTS],
 }
 
 // TODO: Despite being intended for async use, this code does have busy loops in a few places,
@@ -92,7 +92,7 @@ impl<'d> State<'d> {
             ep_out_config: [None; NUM_OUT_ENDPOINTS],
             ep_in_waker: core::array::from_fn(|_| AtomicWaker::new()),
             ep_out_waker: core::array::from_fn(|_| AtomicWaker::new()),
-            ep_out_readers: core::array::from_fn(|_| ReadBuf::new()),
+            ep_out_readers: core::array::from_fn(|_| ReadOpPtr::new()),
         };
 
         // Endpoint 0 always exists.
@@ -402,12 +402,12 @@ impl<'d> State<'d> {
         }
     }
 
-    fn poll_out_ep_start_read(
+    fn poll_out_ep_start_read<'b>(
         &mut self,
         cx: &mut core::task::Context,
-        ep_index: usize,
-        buf: &mut [u8],
+        mut read_op: Pin<&mut ReadOperation<'b, 'd>>,
     ) -> Poll<Result<(), EndpointError>> {
+        let ep_index = read_op.ep_index;
         trace!("OUT EP{} RX: polling for start read", ep_index);
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
@@ -426,8 +426,14 @@ impl<'d> State<'d> {
         self.ep_out_waker[ep_index].register(cx.waker());
 
         // Try to register as the current reader for this endpoint
-        if self.ep_out_readers[ep_index].set_reader(buf).is_err() {
+        if self.ep_out_readers[ep_index]
+            .set_reader(read_op.as_mut())
+            .is_err()
+        {
             // Another task is already reading on this endpoint.  Wait until it finishes.
+            // (This seems like it perhaps isn't possible in practice, since EndpointOut::read() is
+            // the only function that can call into this code, and it requires a mutable reference
+            // to the EndpointOut object for the entire duration of the read.)
             trace!(
                 "OUT EP{} RX: waiting for in-progress read to complete",
                 ep_index
@@ -445,7 +451,7 @@ impl<'d> State<'d> {
         // If the host sends more data in the transfer than the user requested, we want to know and
         // generate an error.
         let read_size = ep_config.max_packet_size;
-        assert!(read_size as usize >= buf.len());
+        assert!(read_size as usize >= read_op.buf.len());
         if ep_index == 0 {
             let out_ep = self.usb0.out_ep0();
             // Endpoint 0 only supports reading up to 1 OUT packet at a time
@@ -476,18 +482,19 @@ impl<'d> State<'d> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_out_ep_read_complete(
+    fn poll_out_ep_read_complete<'b>(
         &mut self,
         cx: &mut core::task::Context,
-        ep_index: usize,
+        read_op: Pin<&mut ReadOperation<'b, 'd>>,
     ) -> Poll<Result<usize, EndpointError>> {
+        let ep_index = read_op.ep_index;
         trace!("OUT EP{} RX: polling for read complete", ep_index);
         if ep_index == 0 {
             // https://github.com/embassy-rs/embassy/issues/2751
             self.poll_usb(cx);
         }
 
-        if let Some(result) = self.ep_out_readers[ep_index].check_read_complete() {
+        if let Some(result) = read_op.check_read_complete() {
             return Poll::Ready(result);
         }
         if let Some(err) = self.check_out_read_error(ep_index, true) {
@@ -540,11 +547,12 @@ impl<'d> State<'d> {
         None
     }
 
-    fn read_operation_dropped(&mut self, ep_index: usize, buf: &mut [u8]) {
+    fn read_operation_dropped<'b>(&mut self, read_op: &mut ReadOperation<'b, 'd>) {
+        let ep_index = read_op.ep_index;
         // If this is the current reader, stop the read.
         // (It is possible that this is an old ReadOperation that already finished,
         // and the caller started a new read before dropping their old ReadOperation variable.)
-        let is_current = self.ep_out_readers[ep_index].read_operation_dropped(buf);
+        let is_current = self.ep_out_readers[read_op.ep_index].read_operation_dropped(read_op);
         if is_current {
             // Ask the hardware to NAK new OUT packets and disable active transfers.
             // Note: this is not immediately effective, and the hardware may still place another packet
@@ -1038,17 +1046,16 @@ impl<'d> State<'d> {
     }
 
     fn receive_packet(&mut self, ep_index: u8, byte_count: u16) {
-        // Safety: the caller's buffer is valid for as long as the ReadOperation,
-        // and the ReadOperation will clear self.ep_out_readers[ep_index] when it is dropped.
-        // We know the buffer is valid if get_buffer() returns Some(buffer) buffer here
-        let maybe_read_buf = unsafe { self.ep_out_readers[ep_index as usize].get_buffer() };
-        if let Some(buf) = maybe_read_buf {
-            if byte_count as usize > buf.len() {
+        // Safety: the ReadOperation reference here is only valid until we return or otherwise
+        // yield to the executor.
+        let maybe_read_op = unsafe { self.ep_out_readers[ep_index as usize].get_read_op() };
+        if let Some(read_op) = maybe_read_op {
+            if byte_count as usize > read_op.buf.len() {
                 self.discard_rx_fifo_data(byte_count);
-                self.ep_out_readers[ep_index as usize].record_buffer_overflow(byte_count as usize);
+                read_op.record_buffer_overflow(byte_count as usize);
             } else {
-                self.read_rx_fifo_data(&mut buf[0..byte_count as usize]);
-                self.ep_out_readers[ep_index as usize].append_bytes_read(byte_count as usize);
+                self.read_rx_fifo_data(&mut read_op.buf[0..byte_count as usize]);
+                read_op.append_bytes_read(byte_count as usize);
             }
         } else {
             // This can happen if the caller aborted their read at roughly the same time as a
@@ -1673,129 +1680,75 @@ impl<'d> State<'d> {
     }
 }
 
-pub(crate) async fn start_read_op<'b, 'd>(
-    state: &'d RefCell<State<'d>>,
-    ep_index: usize,
-    buf: &'b mut [u8],
-) -> Result<ReadOperation<'b, 'd>, EndpointError> {
-    poll_fn(|cx| {
-        let mut state = state.borrow_mut();
-        state.poll_out_ep_start_read(cx, ep_index, buf)
-    })
-    .await?;
-
-    Ok(ReadOperation {
-        state,
-        buf,
-        ep_index,
-    })
+#[derive(Debug, Eq, PartialEq)]
+enum ReadStatus {
+    NotStarted,
+    InProgress,
+    Complete,
+    BufferOverflow,
 }
 
 /// ReadOperation exists for the duration of an in-progress read attempt.
 ///
 /// This allows us to be notified when it is dropped, and ask the hardware to stop accepting OUT
 /// packets if our caller cancels the read.
+///
+/// ReadOperation objects must be pinned in memory for the duration of the read.
 pub(crate) struct ReadOperation<'b, 'd> {
     state: &'d RefCell<State<'d>>,
-    buf: &'b mut [u8],
     ep_index: usize,
-}
+    _pin: core::marker::PhantomPinned,
 
-impl<'b, 'd> ReadOperation<'b, 'd> {
-    pub(crate) async fn do_read(&mut self) -> Result<usize, EndpointError> {
-        poll_fn(|cx| {
-            let mut state = self.state.borrow_mut();
-            state.poll_out_ep_read_complete(cx, self.ep_index)
-        })
-        .await
-    }
-}
-
-impl<'b, 'd> Drop for ReadOperation<'b, 'd> {
-    fn drop(&mut self) {
-        // ReadOperation objects are owned by higher level code, and should never be
-        // dropped during any operation where we have already borrowed self.state
-        self.state
-            .borrow_mut()
-            .read_operation_dropped(self.ep_index, self.buf);
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum ReadStatus {
-    Idle,
-    Pending,
-    Complete,
-    BufferOverflow,
-}
-
-struct ReadBuf {
-    ptr: *mut u8,
-    capacity: usize,
-    // TODO: move bytes_read and status into a separate caller-owned struct,
-    // so we can start a new read as soon as an old one completes, instead of having
-    // to wait for the old ReadOperation to be dropped.
+    buf: &'b mut [u8],
     bytes_read: usize,
     status: ReadStatus,
 }
 
-#[derive(Debug)]
-struct EndpointBusy;
-
-impl ReadBuf {
-    fn new() -> Self {
+impl<'b, 'd> ReadOperation<'b, 'd> {
+    pub(crate) fn new(state: &'d RefCell<State<'d>>, ep_index: usize, buf: &'b mut [u8]) -> Self {
         Self {
-            ptr: core::ptr::null_mut(),
-            capacity: 0,
+            state,
+            ep_index,
+            _pin: core::marker::PhantomPinned,
+            buf,
             bytes_read: 0,
-            status: ReadStatus::Idle,
+            status: ReadStatus::NotStarted,
         }
     }
 
-    fn set_reader(&mut self, buf: &mut [u8]) -> Result<(), EndpointBusy> {
-        if self.ptr != core::ptr::null_mut() {
-            return Err(EndpointBusy);
-        }
-        self.ptr = buf.as_mut_ptr();
-        self.capacity = buf.len();
-        self.bytes_read = 0;
-        self.status = ReadStatus::Pending;
-        Ok(())
+    pub(crate) fn poll_start(
+        self: Pin<&mut Self>,
+        cx: &mut core::task::Context,
+    ) -> Poll<Result<(), EndpointError>> {
+        self.state.borrow_mut().poll_out_ep_start_read(cx, self)
     }
 
-    // Returns true if this ReadOperation was the current reader.
-    fn read_operation_dropped(&mut self, buf: &mut [u8]) -> bool {
-        if self.ptr != buf.as_mut_ptr() {
-            // This is presumably an old ReadOperation that already finished.
-            // We may have already started a new read, so don't change the current state.
-            return false;
-        }
-        self.ptr = core::ptr::null_mut();
-        self.capacity = 0;
-        self.bytes_read = 0;
-        self.status = ReadStatus::Idle;
-        true
+    pub(crate) fn poll_complete(
+        self: Pin<&mut Self>,
+        cx: &mut core::task::Context,
+    ) -> Poll<Result<usize, EndpointError>> {
+        self.state.borrow_mut().poll_out_ep_read_complete(cx, self)
     }
 
     fn append_bytes_read(&mut self, bytes_read: usize) {
-        assert_eq!(self.status, ReadStatus::Pending);
+        assert_eq!(self.status, ReadStatus::InProgress);
         self.bytes_read += bytes_read;
     }
 
     fn record_buffer_overflow(&mut self, bytes_read: usize) {
-        assert_eq!(self.status, ReadStatus::Pending);
+        assert_eq!(self.status, ReadStatus::InProgress);
         warn!(
             "read buffer overflow: caller asked for {} bytes, but host sent {}",
-            self.capacity,
+            self.buf.len(),
             self.bytes_read + bytes_read
         );
         self.status = ReadStatus::BufferOverflow;
     }
 
     fn read_complete(&mut self) {
-        assert_eq!(self.status, ReadStatus::Pending);
+        assert_eq!(self.status, ReadStatus::InProgress);
         match self.status {
-            ReadStatus::Pending => {
+            ReadStatus::InProgress => {
                 self.status = ReadStatus::Complete;
             }
             ReadStatus::BufferOverflow => {
@@ -1804,33 +1757,109 @@ impl ReadBuf {
             ReadStatus::Complete => {
                 panic!("read complete called twice");
             }
-            ReadStatus::Idle => {
-                panic!("no pending read");
+            ReadStatus::NotStarted => {
+                panic!("read complete called when read was not yet started");
             }
         }
-        self.status = ReadStatus::Complete;
     }
 
-    fn check_read_complete(&mut self) -> Option<Result<usize, EndpointError>> {
+    fn check_read_complete(&self) -> Option<Result<usize, EndpointError>> {
         match self.status {
-            ReadStatus::Pending => None,
+            ReadStatus::InProgress => None,
             ReadStatus::Complete => Some(Ok(self.bytes_read)),
             ReadStatus::BufferOverflow => Some(Err(EndpointError::BufferOverflow)),
-            ReadStatus::Idle => {
-                panic!("no pending read");
+            ReadStatus::NotStarted => {
+                panic!("read not started");
             }
         }
     }
+}
 
-    // Safety: the lifetime of the returned buf reference isn't actually static;
-    // It is the lifetime of the current ReadOperation object.  Our caller has to be
-    // careful never to store this reference and always use it before yielding back to the
-    // executor.
-    unsafe fn get_buffer(&self) -> Option<&'static mut [u8]> {
-        if self.ptr == core::ptr::null_mut() {
+impl<'b, 'd> Drop for ReadOperation<'b, 'd> {
+    fn drop(&mut self) {
+        // ReadOperation objects are owned by higher level code, and should never be
+        // dropped during any operation where we have already borrowed self.state
+        self.state.borrow_mut().read_operation_dropped(self);
+    }
+}
+
+/// ReadOpPtr stores a pointer to the current ReadOperation on a given IN endpoint.
+///
+/// ReadOperation objects must be pinned in memory for the duration of the read operation.
+/// ReadOpPtr manages storing the pointer to the current read operation, providing access to it
+/// when new data arrives for the read, and clearing it when the read operation completes or when
+/// the ReadOperation object is dropped.
+struct ReadOpPtr<'d> {
+    read_op: *mut ReadOperation<'d, 'd>,
+}
+
+#[derive(Debug)]
+struct EndpointBusy;
+
+impl<'d> ReadOpPtr<'d> {
+    fn new() -> Self {
+        Self {
+            read_op: core::ptr::null_mut(),
+        }
+    }
+
+    fn set_reader<'b>(
+        &mut self,
+        mut read_op: Pin<&mut ReadOperation<'b, 'd>>,
+    ) -> Result<(), EndpointBusy> {
+        if self.read_op != core::ptr::null_mut() {
+            return Err(EndpointBusy);
+        }
+        assert!(read_op.status == ReadStatus::NotStarted);
+        // Safety: get_unchecked_mut() is safe here since we do not move any data out of read_op
+        unsafe {
+            read_op.as_mut().get_unchecked_mut().status = ReadStatus::InProgress;
+        }
+
+        // Safety:
+        // The call to get_unchecked_mut() here is safe, since we never move data out of read_op.
+        // We storing the pointer to it so that we can write data that we read into read_op's
+        // buffer, and we never move data out of read_op.
+        //
+        // We are using core::mem::transmute() here to cast away the buffer's lifetime ('b).
+        // This is safe since we clear the self.read_op point when the ReadOp is dropped,
+        // guaranteeing that we store the read_op pointer for less than the 'b lifetime.
+        self.read_op = unsafe { core::mem::transmute(read_op.get_unchecked_mut()) };
+        Ok(())
+    }
+
+    // Returns true if this ReadOperation was the current reader.
+    fn read_operation_dropped<'b>(&mut self, read_op: &mut ReadOperation<'b, 'd>) -> bool {
+        // Safety: we are using core::mem::transmute() here just to cast away the buffer lifetime
+        // for our pointer comparison.
+        if self.read_op == unsafe { core::mem::transmute(read_op) } {
+            self.read_op = core::ptr::null_mut();
+            true
+        } else {
+            // This is presumably an old ReadOperation that already finished.
+            // We may have already started a new read, so don't change the current state.
+            false
+        }
+    }
+
+    fn read_complete(&mut self) {
+        if self.read_op != core::ptr::null_mut() {
+            // Safety: we know that self.read_op is valid at least until we return, since
+            // ReadOperation::drop() will reset our self.read_op pointer to null when the operation
+            // is dropped.
+            unsafe { &mut *self.read_op }.read_complete();
+            self.read_op = core::ptr::null_mut();
+        }
+    }
+
+    // Safety: the lifetime of the returned reference isn't actually 'd;
+    // It is only valid until the caller yields back to the executor.  Our caller has to be careful
+    // never to store this reference and only use it before yielding back to the executor.
+    unsafe fn get_read_op(&self) -> Option<&'d mut ReadOperation<'d, 'd>> {
+        if self.read_op == core::ptr::null_mut() {
             return None;
         }
-        Some(core::slice::from_raw_parts_mut(self.ptr, self.capacity))
+        return Some(&mut *self.read_op);
     }
 }
 

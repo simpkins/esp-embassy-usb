@@ -111,9 +111,15 @@ impl<'d> embassy_usb_driver::EndpointOut for EndpointOut<'d> {
             return Err(EndpointError::BufferOverflow);
         }
 
-        // Start a read operation, then wait for it to complete.
-        let mut read_op = crate::state::start_read_op(&self.state, ep_index, buf).await?;
-        read_op.do_read().await
+        // Start a read operation.
+        // This requires waiting for the endpoint to be free, and not already performing any
+        // other read.
+        let mut read_op =
+            core::pin::pin!(crate::state::ReadOperation::new(self.state, ep_index, buf));
+        poll_fn(|cx| read_op.as_mut().poll_start(cx)).await?;
+
+        // Wait for the read to complete.
+        poll_fn(|cx| read_op.as_mut().poll_complete(cx)).await
     }
 }
 
