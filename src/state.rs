@@ -820,7 +820,7 @@ impl<'d> State<'d> {
             if otgints.sesenddet().bit() {
                 trace!("vbus removed");
                 if self.config.vbus_detection_pin.is_some() {
-                    self.disable_all_endpoints();
+                    self.disable_all_endpoints_on_vbus_removed();
                     self.record_bus_event(Event::PowerRemoved);
                 }
             }
@@ -938,98 +938,103 @@ impl<'d> State<'d> {
         trace!("RX FIFO data ready");
         // Process entries from the FIFO until the FIFO is empty.
         loop {
-            let ctrl_word = self.usb0.grxstsp().read();
-
-            match ctrl_word.pktsts().bits() {
-                pktsts::OUT_PKT_RECEIVED => {
-                    let ep_index = ctrl_word.chnum().bits();
-                    let byte_count = ctrl_word.bcnt().bits();
-                    trace!(
-                        "USB RX: OUT packet received on EP{}: size={}",
-                        ep_index,
-                        byte_count
-                    );
-                    self.receive_packet(ep_index, byte_count);
-                }
-                pktsts::OUT_XFER_COMPLETE => {
-                    let ep_index = ctrl_word.chnum().bits() as usize;
-                    trace!("OUT xfer complete on EP{}", ep_index);
-                    // Given that we only ever read a single packet at a time, we
-                    // currently expect to receive OUT_XFER_COMPLETE after every single
-                    // OUT_PKT_RECEIVED.
-                    self.ep_out_readers[ep_index].read_complete();
-                    self.ep_out_waker[ep_index].wake();
-                }
-                pktsts::SETUP_DONE => {
-                    trace!("SETUP done");
-                    // This entry indicates that the host has sent an IN or OUT token to start the
-                    // DATA phase of a control transfer.  We know that the most recently seen SETUP
-                    // packet is valid for this transfer, and is not going to be superseded by
-                    // another retransmitted SETUP.
-                    //
-                    // When we pop the SETUP_DONE packet the USB core will automatically generate a
-                    // stuppktrcvd OUT endpoint interrupt.  We don't do any other processing here,
-                    // and we wait to deliver the SETUP packet to the embassy-usb code until we
-                    // process the stuppktrcvd interrupt.  This is the behavior recommended by the
-                    // STMicro docs.
-                }
-                pktsts::SETUP_RECEIVED => {
-                    let ep_index = ctrl_word.chnum().bits();
-                    let byte_count = ctrl_word.bcnt().bits();
-                    // SETUP packets are always 8 bytes long.
-                    assert!(byte_count == 8);
-
-                    // Read the SETUP packet into self.ep0_setup_data.
-                    // We don't do anything with it yet: we wait until receiving SETUP_DONE
-                    // before attempting to process this data.
-                    //
-                    // The SETUP_DONE event is used to avoid processing retransmitted SETUP
-                    // packets.  In the case of SETUP retransmission, we may get multiple
-                    // SETUP_RECEIVED events before we get a SETUP_DONE.  The core
-                    // waits to see the next IN or OUT token after the SETUP before it sends us the
-                    // SETUP_DONE event.
-                    let rx_fifo = self.usb0.fifo(0);
-                    if ep_index == 0 {
-                        self.ep0_setup_data[0] = rx_fifo.read().word().bits();
-                        self.ep0_setup_data[1] = rx_fifo.read().word().bits();
-                        trace!(
-                            "SETUP received: {:?} from rx_fifo address {:p}",
-                            bytemuck::cast_slice::<u32, u8>(&self.ep0_setup_data),
-                            rx_fifo
-                        );
-                    } else {
-                        // We only ever configure EP0 as a control endpoint, so we don't expect to
-                        // receive SETUP packets on any other endpoint.  Handle this case just in
-                        // case there is a buggy host implementation that sends us garbage SETUP
-                        // packets on other endpoints.  Pop the data from the FIFO and discard it.
-                        warn!(
-                            "received SETUP packet on unexpected endpoint EP{}",
-                            ep_index
-                        );
-                        let _ = rx_fifo.read();
-                        let _ = rx_fifo.read();
-                    }
-                }
-                pktsts::GLOBAL_OUT_NAK => {
-                    // We don't really expect to get this here.
-                    // set_global_out_nak() will read and consume it on its own.
-                    trace!("global OUT NAK effective");
-                }
-                _ => {
-                    // DATA_TOGGLE_ERROR and CHANNEL_HALTED should only be received in Host mode.
-                    // There are no other valid values.
-                    warn!(
-                        "unexpected data in RX FIFO: {:#x}",
-                        ctrl_word.pktsts().bits()
-                    );
-                }
-            }
+            self.process_one_rx_entry();
 
             // If the rxflvi bit is clear, the FIFO is empty and there is nothing left to process.
             if self.usb0.gintsts().read().rxflvi().bit_is_clear() {
                 return;
             }
         }
+    }
+
+    fn process_one_rx_entry(&mut self) -> u8 {
+        let ctrl_word = self.usb0.grxstsp().read();
+
+        match ctrl_word.pktsts().bits() {
+            pktsts::OUT_PKT_RECEIVED => {
+                let ep_index = ctrl_word.chnum().bits();
+                let byte_count = ctrl_word.bcnt().bits();
+                trace!(
+                    "USB RX: OUT packet received on EP{}: size={}",
+                    ep_index,
+                    byte_count
+                );
+                self.receive_packet(ep_index, byte_count);
+            }
+            pktsts::OUT_XFER_COMPLETE => {
+                let ep_index = ctrl_word.chnum().bits() as usize;
+                trace!("OUT xfer complete on EP{}", ep_index);
+                // Given that we only ever read a single packet at a time, we
+                // currently expect to receive OUT_XFER_COMPLETE after every single
+                // OUT_PKT_RECEIVED.
+                self.ep_out_readers[ep_index].read_complete();
+                self.ep_out_waker[ep_index].wake();
+            }
+            pktsts::SETUP_DONE => {
+                trace!("SETUP done");
+                // This entry indicates that the host has sent an IN or OUT token to start the
+                // DATA phase of a control transfer.  We know that the most recently seen SETUP
+                // packet is valid for this transfer, and is not going to be superseded by
+                // another retransmitted SETUP.
+                //
+                // When we pop the SETUP_DONE packet the USB core will automatically generate a
+                // stuppktrcvd OUT endpoint interrupt.  We don't do any other processing here,
+                // and we wait to deliver the SETUP packet to the embassy-usb code until we
+                // process the stuppktrcvd interrupt.  This is the behavior recommended by the
+                // STMicro docs.
+            }
+            pktsts::SETUP_RECEIVED => {
+                let ep_index = ctrl_word.chnum().bits();
+                let byte_count = ctrl_word.bcnt().bits();
+                // SETUP packets are always 8 bytes long.
+                assert!(byte_count == 8);
+
+                // Read the SETUP packet into self.ep0_setup_data.
+                // We don't do anything with it yet: we wait until receiving SETUP_DONE
+                // before attempting to process this data.
+                //
+                // The SETUP_DONE event is used to avoid processing retransmitted SETUP
+                // packets.  In the case of SETUP retransmission, we may get multiple
+                // SETUP_RECEIVED events before we get a SETUP_DONE.  The core
+                // waits to see the next IN or OUT token after the SETUP before it sends us the
+                // SETUP_DONE event.
+                let rx_fifo = self.usb0.fifo(0);
+                if ep_index == 0 {
+                    self.ep0_setup_data[0] = rx_fifo.read().word().bits();
+                    self.ep0_setup_data[1] = rx_fifo.read().word().bits();
+                    trace!(
+                        "SETUP received: {:?} from rx_fifo address {:p}",
+                        bytemuck::cast_slice::<u32, u8>(&self.ep0_setup_data),
+                        rx_fifo
+                    );
+                } else {
+                    // We only ever configure EP0 as a control endpoint, so we don't expect to
+                    // receive SETUP packets on any other endpoint.  Handle this case just in
+                    // case there is a buggy host implementation that sends us garbage SETUP
+                    // packets on other endpoints.  Pop the data from the FIFO and discard it.
+                    warn!(
+                        "received SETUP packet on unexpected endpoint EP{}",
+                        ep_index
+                    );
+                    let _ = rx_fifo.read();
+                    let _ = rx_fifo.read();
+                }
+            }
+            pktsts::GLOBAL_OUT_NAK => {
+                // Nothing to do here.
+                // set_global_out_nak() will handle this when we return it.
+            }
+            _ => {
+                // DATA_TOGGLE_ERROR and CHANNEL_HALTED should only be received in Host mode.
+                // There are no other valid values.
+                warn!(
+                    "unexpected data in RX FIFO: {:#x}",
+                    ctrl_word.pktsts().bits()
+                );
+            }
+        }
+
+        ctrl_word.pktsts().bits()
     }
 
     fn receive_packet(&mut self, ep_index: u8, byte_count: u16) {
@@ -1076,7 +1081,6 @@ impl<'d> State<'d> {
     fn read_rx_fifo_data(&mut self, buf: &mut [u8]) {
         let rx_fifo = self.usb0.fifo(0);
         let whole_words = buf.len() / 4;
-        // TODO: do testing of both code paths here
         if whole_words > 0 {
             if ((buf.as_ptr() as usize) & 0x3) == 0 {
                 // If the buffer is word-aligned, we can read directly into it
@@ -1236,15 +1240,20 @@ impl<'d> State<'d> {
         self.ep_in_waker[ep_index].wake();
     }
 
-    fn disable_all_endpoints(&mut self) {
+    fn disable_all_endpoints_on_vbus_removed(&mut self) {
         self.flush_fifos_on_reset();
 
-        // TODO clear the usbactep flag in diepctl/doepctl for all endpoints
-        for _n in 1..NUM_IN_ENDPOINTS {
-            // TODO
+        for ep_index in 1..NUM_IN_ENDPOINTS {
+            self.usb0
+                .in_ep(ep_index - 1)
+                .diepctl()
+                .modify(|_, w| w.usbactep().clear_bit());
         }
-        for _n in 1..NUM_OUT_ENDPOINTS {
-            // TODO
+        for ep_index in 1..NUM_OUT_ENDPOINTS {
+            self.usb0
+                .out_ep(ep_index - 1)
+                .doepctl()
+                .modify(|_, w| w.usbactep().clear_bit());
         }
     }
 
@@ -1268,11 +1277,15 @@ impl<'d> State<'d> {
 
     fn stop_all_in_endpoints(&mut self) {
         trace!("stop_all_in_endpoints");
-        // Set the disable and NAK bits
-        // Note: The STMicro docs indicate we should only set the EPDIS bit if the EPENA bit was
-        // set.  That said, given that the core clears EPENA on its own, it doesn't seem
-        // like we can guarantee it was set already when we set the disable flag.  Unconditionally
-        // setting the EPDIS bits here seems to work fine in practice.
+
+        // This is based on documentation for the Synopsys USB cores in STMicro chips.
+        // See "Transfer Stop Programming for IN endpoints" in section 34.17.6 of the STM32F405
+        // reference manual.
+
+        // AHB must be idle before we can disable actively writing IN endpoints
+        while self.usb0.grstctl().read().ahbidle().bit_is_clear() {}
+
+        // Set the EPDIS flag on all endpoints, to stop any in-progress writes
         self.usb0
             .in_ep0()
             .diepctl()
@@ -1305,21 +1318,25 @@ impl<'d> State<'d> {
             {}
         }
 
-        // Flush all TX FIFOs
+        // Flush all TX FIFOs.  Flushing with fifo number 0x10 flushes all FIFOs.
+        self.flush_tx_fifo(0x10);
+    }
+
+    fn flush_tx_fifo(&mut self, fifo_number: u8) {
         self.usb0
             .grstctl()
-            .modify(|_, w| unsafe { w.txfnum().bits(0x10) }.txfflsh().set_bit());
+            .modify(|_, w| unsafe { w.txfnum().bits(fifo_number) }.txfflsh().set_bit());
         // Busy loop for the flush to complete.
         while self.usb0.grstctl().read().txfflsh().bit_is_set() {}
     }
 
     fn stop_all_out_endpoints(&mut self) {
         trace!("stop_all_out_endpoints");
-        // This is based on documentation for the synopsys USB cores in STMicro chips.
+        // This is based on documentation for the Synopsys USB cores in STMicro chips.
         // See "Transfer Stop Programming for OUT Endpoints" in section 34.17.5 of the STM32F405
         // reference manual.
 
-        // 1. Enable all OUT endpoints
+        // 1. Enable reads on all OUT endpoints
         self.usb0
             .out_ep0()
             .doepctl()
@@ -1394,41 +1411,12 @@ impl<'d> State<'d> {
         // Set the global OUT NAK bit
         self.usb0.dctl().modify(|_, w| w.sgoutnak().set_bit());
 
-        // Read from the RX FIFO until we see the GLOBAL_OUT_NAK effective control word
-        // TODO: create a helper function to process one RX FIFO entry, and then share that with
-        // the normal process_rx_fifo() code?
-        //
-        // TODO: Actually, it would be better to just turn this function completely async.
-        // Rather than trying to do everything in poll_usb(), we could have Bus::poll() do some of
-        // the async handling work after it sees a Reset event.  We would need a small helper guard
-        // object to reference count how many people want global out nak mode enabled, so that if
-        // it is invoked multiple times we only turn it off when the last use goes away.
+        // Process entries from the RX FIFO until we see the GLOBAL_OUT_NAK effective control word.
         loop {
             while self.usb0.gintsts().read().rxflvi().bit_is_clear() {}
-            let ctrl_word = self.usb0.grxstsp().read();
-            match ctrl_word.pktsts().bits() {
-                pktsts::GLOBAL_OUT_NAK => {
-                    break;
-                }
-                pktsts::SETUP_RECEIVED => {
-                    // We may receive a SETUP packet if there was already one in the RX FIFO
-                    // that we hadn't read.
-                    trace!("received SETUP packet while waiting on global OUT NAK effective");
-                    // Read and discard the setup packet.
-                    // TODO: perhaps we should save it?
-                    let rx_fifo = self.usb0.fifo(0);
-                    let _ = rx_fifo.read();
-                    let _ = rx_fifo.read();
-                    break;
-                }
-                _ => {
-                    // TODO: there may have been a valid OUT packet already present in the RX FIFO that
-                    // we need to read and discard.
-                    warn!(
-                        "valid entry in RX FIFO before GLOBAL_OUT_NAK: {:#x}",
-                        ctrl_word.pktsts().bits()
-                    );
-                }
+            let ctrl_word = self.process_one_rx_entry();
+            if ctrl_word == pktsts::GLOBAL_OUT_NAK {
+                break;
             }
         }
 
@@ -1533,20 +1521,86 @@ impl<'d> State<'d> {
     }
 
     pub fn disable_in_ep(&mut self, ep_index: usize) {
-        // TODO
-        error!("TODO: disable IN EP{}", ep_index);
         assert_ne!(ep_index, 0); // EP0 is always enabled
         assert!(ep_index < NUM_IN_ENDPOINTS);
+
+        // Note: this method unfortunately has several busy loops.  It would be nicer if
+        // Bus::endpoint_set_enabled() were an async method (although we would require some more
+        // complicated state management to deal with this).
+
+        // Clear the usbactep bit, and set the NAK flag
+        let ep_in = self.usb0.in_ep(ep_index - 1);
+        let mut write_in_progress = false;
+        ep_in.diepctl().modify(|r, w| {
+            write_in_progress = r.epena().bit_is_set();
+            w.usbactep().clear_bit().snak().set_bit()
+        });
+
+        // If there was a write in progress on the endpoint, we have to abort it.
+        // If not, we are done.
+        if !write_in_progress {
+            return;
+        }
+
+        // This is based on documentation for the Synopsys USB cores in STMicro chips.
+        // See "IN endpoint disable" in section 34.17.6 of the STM32F405 reference manual.
+
+        // AHB must be idle before we can disable IN endpoints
+        while self.usb0.grstctl().read().ahbidle().bit_is_clear() {}
+
+        // Wait for the NAK flag to take effect on this endpoint.
+        while ep_in.diepint().read().inepnakeff().bit_is_clear() {}
+
+        // It seems like it might be okay to return early here if diepctl.epena is no longer set
+        // at this point, if the endpoint finished the write before the NAK flag took effect?
+        // For now we unconditionally continue setting the EPDIS flag.
+
+        // Set the EPDIS and SNAK flags.
+        ep_in
+            .diepctl()
+            .modify(|_, w| w.epdis().set_bit().snak().set_bit());
+        // Wait for the disable to take effect
+        while ep_in.diepint().read().epdisbld().bit_is_clear() {}
+
+        // Flush any remaining data in the TX FIFO
+        let fifo_number = match self.ep_in_config[ep_index] {
+            Some(cfg) => cfg.tx_fifo,
+            None => return, // shouldn't happen for valid endpoints that were actively writing
+        };
+        self.flush_tx_fifo(fifo_number);
     }
 
     pub fn disable_out_ep(&mut self, ep_index: usize) {
+        assert_ne!(ep_index, 0); // EP0 is always enabled
+        assert!(ep_index < NUM_IN_ENDPOINTS);
+
+        let ep_out = self.usb0.out_ep(ep_index - 1);
+        let mut read_in_progress = false;
+        ep_out.doepctl().modify(|r, w| {
+            read_in_progress = r.epena().bit_is_set();
+            w.usbactep().clear_bit().snak().set_bit()
+        });
+
+        if !read_in_progress {
+            return;
+        }
+
+        // This is based on documentation for the Synopsys USB cores in STMicro chips.
+        // See "Disabling an OUT endpoint" in section 34.17.6 of the STM32F405 reference manual.
+
         // The global OUT NAK flag must be set before disabling any OUT endpoint.
         self.set_global_out_nak();
         assert_ne!(ep_index, 0); // EP0 is always enabled
         assert!(ep_index < NUM_OUT_ENDPOINTS);
 
-        // TODO
-        error!("TODO: disable OUT EP{}", ep_index);
+        // Set the EPDIS and SNAK flags
+        let ep_out = self.usb0.out_ep(ep_index - 1);
+        ep_out
+            .doepctl()
+            .modify(|_, w| w.epdis().set_bit().snak().set_bit());
+
+        // Wait for an epdisbld interrupt to confirm that the disable has taken effect.
+        while ep_out.doepint().read().epdisbld().bit_is_clear() {}
 
         // Exit global OUT NAK mode
         self.usb0.dctl().modify(|_, w| w.cgoutnak().set_bit());
