@@ -1,19 +1,19 @@
 #![no_std]
 #![no_main]
-#![feature(type_alias_impl_trait)] // needed by embassy-executor's #[main] macro
+#![feature(type_alias_impl_trait)] // needed by esp_hal_procmacros::main
 
-use example_utils::TimestampLogger;
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_executor::Spawner;
 use embassy_usb::class::hid::{HidReaderWriter, ReportId, RequestHandler, State as HidState};
 use embassy_usb::control::OutResponse;
 use embassy_usb::{Builder, Handler};
 use esp_backtrace as _;
-use esp_embassy_usb::{Config as UsbConfig, State};
+use esp_embassy_usb::{Config as UsbConfig, State as UsbState};
 use esp_hal::gpio;
 use esp_hal::timer::TimerGroup;
 use esp_hal::{clock::ClockControl, peripherals::Peripherals, prelude::*};
 use esp_hal_procmacros::main;
+use example_utils::TimestampLogger;
 use usbd_hid::descriptor::{KeyboardReport, SerializedDescriptor};
 
 #[main]
@@ -41,7 +41,7 @@ async fn main(_spawner: Spawner) {
 
     let config = UsbConfig::default();
     log::info!("creating usb driver");
-    let mut state = State::new(
+    let mut state = UsbState::new(
         peripherals.USB0,
         peripherals.USB_WRAP,
         &peripherals.LPWR,
@@ -55,10 +55,8 @@ async fn main(_spawner: Spawner) {
     // Create embassy-usb Config
     let mut config = embassy_usb::Config::new(0x6666, 0x6666);
     config.manufacturer = Some("Embassy");
-    config.product = Some("HID keyboard example");
+    config.product = Some("HID Keyboard Example");
     config.serial_number = Some("12345678");
-    config.max_power = 100;
-    config.max_packet_size_0 = 64;
 
     // Create embassy-usb DeviceBuilder using the driver and config.
     // It needs some buffers for building the descriptors.
