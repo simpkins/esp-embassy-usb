@@ -1446,7 +1446,7 @@ impl<'d> State<'d> {
         }
     }
 
-    pub fn enable_in_ep(&mut self, ep_index: usize) {
+    pub fn in_ep_enable(&mut self, ep_index: usize) {
         trace!("enabling IN EP{}", ep_index);
         assert_ne!(ep_index, 0); // EP0 is always enabled
         assert!(ep_index < NUM_IN_ENDPOINTS);
@@ -1488,7 +1488,7 @@ impl<'d> State<'d> {
         self.ep_in_waker[ep_index].wake();
     }
 
-    pub fn enable_out_ep(&mut self, ep_index: usize) {
+    pub fn out_ep_enable(&mut self, ep_index: usize) {
         trace!("enabling OUT EP{}", ep_index);
         assert_ne!(ep_index, 0); // EP0 is always enabled
         assert!(ep_index < NUM_OUT_ENDPOINTS);
@@ -1527,7 +1527,7 @@ impl<'d> State<'d> {
         self.ep_out_waker[ep_index].wake();
     }
 
-    pub fn disable_in_ep(&mut self, ep_index: usize) {
+    pub fn in_ep_disable(&mut self, ep_index: usize) {
         assert_ne!(ep_index, 0); // EP0 is always enabled
         assert!(ep_index < NUM_IN_ENDPOINTS);
 
@@ -1577,7 +1577,7 @@ impl<'d> State<'d> {
         self.flush_tx_fifo(fifo_number);
     }
 
-    pub fn disable_out_ep(&mut self, ep_index: usize) {
+    pub fn out_ep_disable(&mut self, ep_index: usize) {
         assert_ne!(ep_index, 0); // EP0 is always enabled
         assert!(ep_index < NUM_IN_ENDPOINTS);
 
@@ -1613,18 +1613,18 @@ impl<'d> State<'d> {
         self.usb0.dctl().modify(|_, w| w.cgoutnak().set_bit());
     }
 
-    pub fn stall_in_ep(&self, ep_index: usize) {
+    pub fn in_ep_set_stalled(&self, ep_index: usize, stalled: bool) {
         if ep_index == 0 {
             self.usb0
                 .in_ep0()
                 .diepctl()
-                .modify(|_, w| w.stall().set_bit());
+                .modify(|_, w| w.stall().bit(stalled));
         } else {
             assert!(ep_index < NUM_IN_ENDPOINTS);
             self.usb0
                 .in_ep(ep_index - 1)
                 .diepctl()
-                .modify(|_, w| w.stall().set_bit());
+                .modify(|_, w| w.stall().bit(stalled));
         }
 
         // Note: the embassy-stm32 implementation wakes the endpoint waker here,
@@ -1632,18 +1632,18 @@ impl<'d> State<'d> {
         // would care about the stall flag changing.
     }
 
-    pub fn stall_out_ep(&self, ep_index: usize) {
+    pub fn out_ep_set_stalled(&self, ep_index: usize, stalled: bool) {
         if ep_index == 0 {
             self.usb0
                 .out_ep0()
                 .doepctl()
-                .modify(|_, w| w.stall().set_bit());
+                .modify(|_, w| w.stall().bit(stalled));
         } else {
             assert!(ep_index < NUM_OUT_ENDPOINTS);
             self.usb0
                 .out_ep(ep_index - 1)
                 .doepctl()
-                .modify(|_, w| w.stall().set_bit());
+                .modify(|_, w| w.stall().bit(stalled));
         }
 
         // Note: the embassy-stm32 implementation wakes the endpoint waker here,
@@ -1651,7 +1651,7 @@ impl<'d> State<'d> {
         // would care about the stall flag changing.
     }
 
-    pub fn is_in_ep_stalled(&self, ep_index: usize) -> bool {
+    pub fn in_ep_is_stalled(&self, ep_index: usize) -> bool {
         if ep_index == 0 {
             self.usb0.in_ep0().diepctl().read().stall().bit_is_set()
         } else {
@@ -1665,7 +1665,7 @@ impl<'d> State<'d> {
         }
     }
 
-    pub fn is_out_ep_stalled(&self, ep_index: usize) -> bool {
+    pub fn out_ep_is_stalled(&self, ep_index: usize) -> bool {
         if ep_index == 0 {
             self.usb0.out_ep0().doepctl().read().stall().bit_is_set()
         } else {

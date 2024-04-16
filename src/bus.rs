@@ -22,15 +22,15 @@ impl<'d> embassy_usb_driver::Bus for Bus<'d> {
     fn endpoint_set_stalled(&mut self, ep_addr: EndpointAddress, stalled: bool) {
         trace!("endpoint_set_stalled ep={:?} en={}", ep_addr, stalled);
         match ep_addr.direction() {
-            Direction::Out => self.state.borrow_mut().stall_out_ep(ep_addr.index()),
-            Direction::In => self.state.borrow_mut().stall_in_ep(ep_addr.index()),
+            Direction::Out => self.state.borrow_mut().out_ep_set_stalled(ep_addr.index(), stalled),
+            Direction::In => self.state.borrow_mut().in_ep_set_stalled(ep_addr.index(), stalled),
         }
     }
 
     fn endpoint_is_stalled(&mut self, ep_addr: EndpointAddress) -> bool {
         match ep_addr.direction() {
-            Direction::Out => self.state.borrow().is_out_ep_stalled(ep_addr.index()),
-            Direction::In => self.state.borrow().is_in_ep_stalled(ep_addr.index()),
+            Direction::Out => self.state.borrow().out_ep_is_stalled(ep_addr.index()),
+            Direction::In => self.state.borrow().in_ep_is_stalled(ep_addr.index()),
         }
     }
 
@@ -46,10 +46,10 @@ impl<'d> embassy_usb_driver::Bus for Bus<'d> {
     fn endpoint_set_enabled(&mut self, ep_addr: EndpointAddress, enabled: bool) {
         trace!("endpoint_set_enabled ep={:?} en={}", ep_addr, enabled);
         match (ep_addr.direction(), enabled) {
-            (Direction::Out, true) => self.state.borrow_mut().enable_out_ep(ep_addr.index()),
-            (Direction::Out, false) => self.state.borrow_mut().disable_out_ep(ep_addr.index()),
-            (Direction::In, true) => self.state.borrow_mut().enable_in_ep(ep_addr.index()),
-            (Direction::In, false) => self.state.borrow_mut().disable_in_ep(ep_addr.index()),
+            (Direction::Out, true) => self.state.borrow_mut().out_ep_enable(ep_addr.index()),
+            (Direction::Out, false) => self.state.borrow_mut().out_ep_disable(ep_addr.index()),
+            (Direction::In, true) => self.state.borrow_mut().in_ep_enable(ep_addr.index()),
+            (Direction::In, false) => self.state.borrow_mut().in_ep_disable(ep_addr.index()),
         }
     }
 

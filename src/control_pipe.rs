@@ -66,8 +66,8 @@ impl<'d> embassy_usb_driver::ControlPipe for ControlPipe<'d> {
     async fn reject(&mut self) {
         trace!("EP0: reject");
         let state = self.state().borrow_mut();
-        state.stall_in_ep(0);
-        state.stall_out_ep(0);
+        state.in_ep_set_stalled(0, true);
+        state.out_ep_set_stalled(0, true);
     }
 
     async fn accept_set_address(&mut self, addr: u8) {
