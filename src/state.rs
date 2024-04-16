@@ -244,6 +244,11 @@ impl<'d> State<'d> {
             unsafe { w.usbtrdtim().bits(5) }
         });
 
+        // Setting the forcedevmode() flag in gusbcfg may take up to 25ms to take effect.
+        // Loop until we see the correct mode reflected in gintsts.
+        // If we don't wait here, we will get a modemis interrupt later when we try to update dctl.
+        while self.usb0.gintsts().read().curmod_int().bit_is_set() {}
+
         // Clear overrides in the OTG configuration
         self.usb0.gotgctl().modify(|_, w| {
             w.bvalidovval()
