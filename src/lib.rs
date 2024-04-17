@@ -16,7 +16,6 @@ mod control_pipe;
 mod driver;
 mod endpoint;
 mod fmt;
-mod interrupt;
 mod phy;
 mod state;
 

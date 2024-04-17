@@ -8,6 +8,7 @@ use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::{EndpointAllocError, EndpointError, EndpointType, Event};
 use esp_hal::peripheral::PeripheralRef;
 use esp_hal::peripherals::{Interrupt, USB0};
+use esp_hal_procmacros::handler;
 
 pub const NUM_IN_ENDPOINTS: usize = 7;
 pub const NUM_OUT_ENDPOINTS: usize = 7;
@@ -191,7 +192,7 @@ impl<'d> State<'d> {
     }
 
     pub fn set_address(&mut self, address: u8) {
-        self.usb0.dcfg().modify(|_, w| w.devaddr().bits(address));
+        self.usb0.dcfg().modify(|_, w| w.devaddr().set(address));
     }
 
     pub fn init_bus(&mut self, fifo_settings: &FifoSizes) {
@@ -275,6 +276,9 @@ impl<'d> State<'d> {
         self.enable_intmask();
 
         // Enable the interrupt handler
+        unsafe {
+            esp_hal::interrupt::bind_interrupt(Interrupt::USB, interrupt_handler.handler());
+        }
         esp_hal::interrupt::enable(Interrupt::USB, esp_hal::interrupt::Priority::Priority1)
             .expect("failed to enable USB interrupt");
 
@@ -462,7 +466,7 @@ impl<'d> State<'d> {
             // Endpoint 0 only supports reading up to 1 OUT packet at a time
             out_ep
                 .doeptsiz()
-                .modify(|_, w| w.xfersize().bits(read_size as u8).pktcnt().set_bit());
+                .modify(|_, w| w.xfersize().set(read_size as u8).pktcnt().set_bit());
             // Clear the NAK flag and enable endpoint to allow the hardware to start reading.
             out_ep
                 .doepctl()
@@ -471,9 +475,9 @@ impl<'d> State<'d> {
             let out_ep = self.usb0.out_ep(ep_index - 1);
             out_ep.doeptsiz().modify(|_, w| {
                 w.xfersize()
-                    .bits(read_size as u32)
+                    .set(read_size as u32)
                     .pktcnt()
-                    .bits(NUM_PACKETS as u16)
+                    .set(NUM_PACKETS as u16)
             });
             // Clear the NAK flag and enable endpoint to allow the hardware to start reading.
             //
@@ -686,12 +690,9 @@ impl<'d> State<'d> {
         // and then update diepctl to clear the NAK flag and enable writing.
         if ep_index == 0 {
             let ep_regs = self.usb0.in_ep0();
-            ep_regs.dieptsiz().write(|w| {
-                w.pktcnt()
-                    .bits(NUM_PACKETS)
-                    .xfersize()
-                    .bits(buf.len() as u8)
-            });
+            ep_regs
+                .dieptsiz()
+                .write(|w| w.pktcnt().set(NUM_PACKETS).xfersize().set(buf.len() as u8));
             ep_regs
                 .diepctl()
                 .modify(|_, w| w.cnak().set_bit().epena().set_bit());
@@ -699,9 +700,9 @@ impl<'d> State<'d> {
             let ep_regs = self.usb0.in_ep(ep_index - 1);
             ep_regs.dieptsiz().write(|w| {
                 w.pktcnt()
-                    .bits(NUM_PACKETS as u16)
+                    .set(NUM_PACKETS as u16)
                     .xfersize()
-                    .bits(buf.len() as u32)
+                    .set(buf.len() as u32)
             });
             // TODO: For isochronous endpoints with interval == 1 I believe we need to manually set
             // diepctl.setd0pid or diepctl.setd1pid.
@@ -882,7 +883,7 @@ impl<'d> State<'d> {
         self.nak_all_out_endpoints();
 
         // Clear the device address
-        self.usb0.dcfg().modify(|_, w| w.devaddr().bits(0));
+        self.usb0.dcfg().modify(|_, w| w.devaddr().set(0));
 
         // Disable all endpoint interrupts
         self.usb0.daintmsk().write(|w| unsafe { w.bits(0) });
@@ -1511,9 +1512,9 @@ impl<'d> State<'d> {
         trace!("enabling IN EP{}", ep_index);
         ep_out.doepctl().modify(|_, w| {
             w.eptype()
-                .bits(config.ep_type as u8)
+                .set(config.ep_type as u8)
                 .mps()
-                .bits(config.max_packet_size)
+                .set(config.max_packet_size)
                 .usbactep()
                 .set_bit();
             if config.ep_type != EndpointType::Isochronous {
@@ -1683,6 +1684,33 @@ impl<'d> State<'d> {
                 .bit_is_set()
         }
     }
+}
+
+/// The USB interrupt handler.
+///
+/// We do as little work here as possible, and only signal the BUS_WAKER.  This allows us to avoid
+/// needing any manual critical sections when accessing USB0 registers or our State object, as all
+/// modifications (apart from clearing gintmsk) are always done from a normal task and never in
+/// interrupt context.
+///
+/// That said, a downside of this approach is that it may add latency to USB event processing,
+/// since we have to wait for our embassy-usb task to wake up and run in order to process the
+/// events.  If we decide it is necessary for performance, we could move some processing into this
+/// interrupt handler, at the expense of requiring critical sections around some of the USB
+/// register access and around our own state data structures.
+#[handler]
+fn interrupt_handler() {
+    // Safety: this code assumes that the interrupt handler and main USB task code run on the same
+    // CPU core, and therefore cannot both run concurrently.  The interrupt handler can interrupt
+    // the main task code at any point in time, but the main task code cannot execute concurrently
+    // with the interrupt handler.
+    let usb0 = unsafe { &*USB0::PTR };
+    trace!("USB interrupt: 0x{:08x}", usb0.gintsts().read().bits());
+
+    // Mask out all interrupts so we won't be called again until Bus::poll() runs,
+    // then wake Bus::poll().
+    usb0.gintmsk().reset();
+    BUS_WAKER.wake();
 }
 
 #[derive(Debug, Eq, PartialEq)]
