@@ -4,7 +4,10 @@ pub use crate::bus::Bus;
 pub use crate::control_pipe::ControlPipe;
 pub use crate::driver::Driver;
 use core::cell::RefCell;
-use esp_hal::gpio::{DriveStrength, OutputPin};
+use esp_hal::gpio::{
+    AnyPin, DriveStrength, Floating, Input, InputOnlyPinType, InputOutputPinType, Output,
+    OutputPin, PullDown, PushPull,
+};
 use esp_hal::peripheral::Peripheral;
 use esp_hal::peripherals::{LPWR, USB0, USB_WRAP};
 
@@ -17,23 +20,87 @@ mod interrupt;
 mod phy;
 mod state;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PhyType {
     Internal,
-    External,
+    External(ExtPhyConfig),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExtPhyConfig {
+    vp: AnyPin<Input<Floating>, InputOnlyPinType>,
+    vm: AnyPin<Input<Floating>, InputOnlyPinType>,
+    rcv: AnyPin<Input<Floating>, InputOnlyPinType>,
+    oen: AnyPin<Output<PushPull>, InputOutputPinType>,
+    vpo: AnyPin<Output<PushPull>, InputOutputPinType>,
+    vmo: AnyPin<Output<PushPull>, InputOutputPinType>,
+}
+
 pub struct Config {
-    vbus_detection_pin: Option<()>, // TODO: should be an optional GPIO
-    phy_type: PhyType,
+    pub vbus_detection_pin: Option<AnyPin<Input<PullDown>, InputOnlyPinType>>,
+    pub phy_type: PhyType,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl Config {
+    /// Create a config for a bus-powered device using the internal PHY.
+    ///
+    /// Use this if your device is powered by the USB connection.  A vbus monitoring pin is not
+    /// required in this case, since you can assume the bus always has power whenever the device is
+    /// on.
+    pub fn bus_powered() -> Self {
         Self {
             vbus_detection_pin: None,
             phy_type: PhyType::Internal,
+        }
+    }
+
+    /// Create a Config object for a self-powered device using the internal PHY.
+    ///
+    /// The vbus_detection_pin is required to detect when power is present on the bus.  It should
+    /// be connected to the USB VBUS pin using resistors to divide the 5V USB power signal into a
+    /// 3.3V signal for the GPIO input.
+    ///
+    /// To call this with a specific pin, you normally will want to call
+    /// `pin.into_pull_down_input().degrade().into_input_type()` in order to get an appropriate
+    /// AnyPin type.
+    pub fn self_powered(vbus_detection_pin: AnyPin<Input<PullDown>, InputOnlyPinType>) -> Self {
+        Self {
+            vbus_detection_pin: Some(vbus_detection_pin),
+            phy_type: PhyType::Internal,
+        }
+    }
+
+    /// Create a Config object for use with an external PHY.
+    ///
+    /// Note: Section 3.10 of the ESP32-S3 datasheet documents the following pins for the external
+    /// PHY:
+    /// - VP  gpio42
+    /// - VM  gpio41
+    /// - RCV gpio21
+    /// - OEN gpio40
+    /// - VPO gpio39
+    /// - VMO gpio38
+    /// That said, there are comments in the ESP-IDF that any GPIOs can be used and that some of
+    /// these fixed pin definitions should be removed in IDF v6.0.  (See
+    /// components/soc/esp32s3/include/soc/usb_pins.h)
+    ///
+    pub fn external_phy(
+        vp: AnyPin<Input<Floating>, InputOnlyPinType>,
+        vm: AnyPin<Input<Floating>, InputOnlyPinType>,
+        rcv: AnyPin<Input<Floating>, InputOnlyPinType>,
+        oen: AnyPin<Output<PushPull>, InputOutputPinType>,
+        vpo: AnyPin<Output<PushPull>, InputOutputPinType>,
+        vmo: AnyPin<Output<PushPull>, InputOutputPinType>,
+        vbus_detection_pin: Option<AnyPin<Input<PullDown>, InputOnlyPinType>>,
+    ) -> Self {
+        Self {
+            vbus_detection_pin: vbus_detection_pin,
+            phy_type: PhyType::External(ExtPhyConfig {
+                vp,
+                vm,
+                rcv,
+                oen,
+                vpo,
+                vmo,
+            }),
         }
     }
 }
@@ -57,7 +124,7 @@ impl<'d> State<'d> {
         rtc: &LPWR,
         mut dp: impl Peripheral<P = P> + 'd,
         mut dm: impl Peripheral<P = M> + 'd,
-        config: Config,
+        mut config: Config,
     ) -> Self
     where
         P: esp_hal::otg_fs::UsbDp + OutputPin + Send + Sync,
@@ -91,7 +158,7 @@ impl<'d> State<'d> {
         // We really only need access to rtc.usb_conf(), but esp-hal doesn't really expose the type
         // name for this variable without us needing to directly import the specific chip esp-pac
         // crate.
-        crate::phy::init_phy(&config, &*usb_wrap, rtc);
+        crate::phy::init_phy(&mut config, &*usb_wrap, rtc);
 
         Self {
             inner: RefCell::new(crate::state::State::new(usb0, config)),

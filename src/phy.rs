@@ -1,23 +1,53 @@
 use crate::{Config, PhyType};
-use esp_hal::gpio::{connect_high_to_peripheral, connect_low_to_peripheral, InputSignal};
+use esp_hal::gpio::{connect_high_to_peripheral, connect_low_to_peripheral, InputPin, InputSignal};
 use esp_hal::peripherals::{LPWR, USB_WRAP};
 
-pub(crate) fn init_phy(config: &Config, usb_wrap: &USB_WRAP, rtc: &LPWR) {
+pub(crate) fn init_phy(config: &mut Config, usb_wrap: &USB_WRAP, rtc: &LPWR) {
     phy_hal_otg_conf(config, usb_wrap, rtc);
 
-    if let PhyType::External = config.phy_type {
-        // TODO: Configure the pins for the external PHY.
-        // phy_external_iopins_configure(phy_context->iopins)
+    if let PhyType::External(ext_config) = &mut config.phy_type {
+        // TODO: The USB_EXTPHY signal type constants aren't currently defined in the esp-hal
+        let _ = ext_config.vp;
+        let _ = ext_config.vm;
+        let _ = ext_config.rcv;
+        let _ = ext_config.oen;
+        let _ = ext_config.vpo;
+        let _ = ext_config.vmo;
+        /*
+        ext_config
+            .vp
+            .connect_input_to_peripheral(InputSignal::USB_EXTPHY_VP);
+        ext_config
+            .vm
+            .connect_input_to_peripheral(InputSignal::USB_EXTPHY_VM);
+        ext_config
+            .rcv
+            .connect_input_to_peripheral(InputSignal::USB_EXTPHY_RCV);
+        ext_config
+            .oen
+            .connect_peripheral_to_output(OutputSignal::USB_EXTPHY_OEN);
+        ext_config
+            .vpo
+            .connect_peripheral_to_output(OutputSignal::USB_EXTPHY_VPO);
+        ext_config
+            .vmo
+            .connect_peripheral_to_output(OutputSignal::USB_EXTPHY_VMO);
+        */
     }
 
     phy_otg_set_mode_device();
     phy_otg_set_speed_device(usb_wrap);
-    phy_otg_configure_iopins();
+
+    if let Some(pin) = &mut config.vbus_detection_pin {
+        // Note: I'm following the ESP-IDF code from components/usb/include/esp_private/usb_phy.h
+        // here.  It sets USB_SRP_BVALID and not USB_OTG_VBUSVALID.
+        pin.connect_input_to_peripheral(InputSignal::USB_SRP_BVALID);
+    }
 }
 
 fn phy_hal_otg_conf(config: &Config, usb_wrap: &USB_WRAP, rtc: &LPWR) {
     usb_wrap.otg_conf().modify(|_, w| {
-        let w = if let PhyType::External = config.phy_type {
+        let w = if let PhyType::External(_) = config.phy_type {
             w.phy_sel().set_bit()
         } else {
             w.phy_sel().clear_bit()
@@ -76,9 +106,4 @@ fn phy_otg_set_speed_device(usb_wrap: &USB_WRAP) {
             .dm_pulldown()
             .clear_bit()
     });
-}
-
-fn phy_otg_configure_iopins() {
-    // TODO: configure the I/O pins
-    // This is needed for configuring the pin that is monitoring VBUS
 }

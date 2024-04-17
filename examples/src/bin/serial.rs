@@ -35,7 +35,7 @@ async fn main(_spawner: Spawner) {
         esp_hal::interrupt::Priority::Priority1,
     );
 
-    let config = UsbConfig::default();
+    let config = UsbConfig::bus_powered();
     info!("creating usb driver");
     let mut usb_state = UsbState::new(
         peripherals.USB0,
