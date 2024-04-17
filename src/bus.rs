@@ -75,3 +75,9 @@ impl<'d> embassy_usb_driver::Bus for Bus<'d> {
         Err(Unsupported)
     }
 }
+
+impl<'d> Drop for Bus<'d> {
+    fn drop(&mut self) {
+        self.state.borrow_mut().disable_bus();
+    }
+}

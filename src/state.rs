@@ -20,6 +20,7 @@ pub(crate) static BUS_WAKER: AtomicWaker = AtomicWaker::new();
 // This structure keeps track of common shared state needed by the Bus, ControlPipe, and endpoints.
 pub(crate) struct State<'d> {
     usb0: PeripheralRef<'d, USB0>,
+    interrupt_cpu: Option<esp_hal::Cpu>,
 
     config: Config,
     ep0_mps_bits: u8,
@@ -84,6 +85,7 @@ impl<'d> State<'d> {
 
         let mut state = Self {
             usb0: usb0,
+            interrupt_cpu: None,
             config,
             ep0_mps_bits: 0,
             bus_event_flags,
@@ -281,9 +283,31 @@ impl<'d> State<'d> {
         }
         esp_hal::interrupt::enable(Interrupt::USB, esp_hal::interrupt::Priority::Priority1)
             .expect("failed to enable USB interrupt");
+        self.interrupt_cpu = Some(esp_hal::get_core());
 
         // Enable the data line pull-up to connect the bus
         self.usb0.dctl().modify(|_, w| w.sftdiscon().clear_bit());
+    }
+
+    pub(crate) fn disable_bus(&mut self) {
+        if let Some(cpu) = self.interrupt_cpu {
+            esp_hal::interrupt::disable(cpu, Interrupt::USB);
+        }
+
+        // Disconnect the bus pull-ups
+        self.usb0.dctl().modify(|_, w| w.sftdiscon().set_bit());
+
+        // Flush fifos and disable all endpoints
+        self.disable_all_endpoints_on_vbus_removed();
+
+        // Clear the device address
+        self.usb0.dcfg().modify(|_, w| w.devaddr().set(0));
+
+        // Disable all interrupts
+        self.usb0.gintmsk().reset();
+        self.usb0.daintmsk().reset();
+        self.usb0.doepmsk().reset();
+        self.usb0.diepmsk().reset();
     }
 
     pub(crate) fn alloc_in_endpoint(
@@ -886,9 +910,9 @@ impl<'d> State<'d> {
         self.usb0.dcfg().modify(|_, w| w.devaddr().set(0));
 
         // Disable all endpoint interrupts
-        self.usb0.daintmsk().write(|w| unsafe { w.bits(0) });
-        self.usb0.doepmsk().write(|w| unsafe { w.bits(0) });
-        self.usb0.diepmsk().write(|w| unsafe { w.bits(0) });
+        self.usb0.daintmsk().reset();
+        self.usb0.doepmsk().reset();
+        self.usb0.diepmsk().reset();
 
         self.flush_fifos_on_reset();
 

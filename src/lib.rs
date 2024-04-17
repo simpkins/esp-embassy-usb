@@ -114,8 +114,6 @@ pub struct State<'d> {
     inner: RefCell<crate::state::State<'d>>,
 }
 
-// TODO: implement Drop for State, and reset the USB device when it is dropped.
-
 impl<'d> State<'d> {
     pub fn new<P, M>(
         usb0: impl Peripheral<P = USB0> + 'd,
