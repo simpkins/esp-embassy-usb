@@ -1,19 +1,14 @@
 use crate::{Config, PhyType};
-use esp_hal::gpio::{connect_high_to_peripheral, connect_low_to_peripheral, InputPin, InputSignal};
+use esp_hal::gpio::{
+    connect_high_to_peripheral, connect_low_to_peripheral, InputPin, InputSignal, OutputPin,
+    OutputSignal,
+};
 use esp_hal::peripherals::{LPWR, USB_WRAP};
 
 pub(crate) fn init_phy(config: &mut Config, usb_wrap: &USB_WRAP, rtc: &LPWR) {
     phy_hal_otg_conf(config, usb_wrap, rtc);
 
     if let PhyType::External(ext_config) = &mut config.phy_type {
-        // TODO: The USB_EXTPHY signal type constants aren't currently defined in the esp-hal
-        let _ = ext_config.vp;
-        let _ = ext_config.vm;
-        let _ = ext_config.rcv;
-        let _ = ext_config.oen;
-        let _ = ext_config.vpo;
-        let _ = ext_config.vmo;
-        /*
         ext_config
             .vp
             .connect_input_to_peripheral(InputSignal::USB_EXTPHY_VP);
@@ -32,7 +27,6 @@ pub(crate) fn init_phy(config: &mut Config, usb_wrap: &USB_WRAP, rtc: &LPWR) {
         ext_config
             .vmo
             .connect_peripheral_to_output(OutputSignal::USB_EXTPHY_VMO);
-        */
     }
 
     phy_otg_set_mode_device();

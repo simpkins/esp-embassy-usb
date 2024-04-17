@@ -42,5 +42,5 @@ usbd-hid-macros = { git = "https://github.com/simpkins/usbd-hid-rs.git", rev = "
 usbd-hid = { git = "https://github.com/simpkins/usbd-hid-rs.git", rev = "593e825" }
 # Use a version of esp-hal that depends includes the esp-pacs change
 # https://github.com/esp-rs/esp-pacs/pull/213
-esp-hal = { git = "https://github.com/esp-rs/esp-hal.git", rev = "17492f6b" }
-esp-hal-procmacros = { git = "https://github.com/esp-rs/esp-hal.git", rev = "17492f6b" }
+esp-hal = { git = "https://github.com/simpkins/esp-hal.git", rev = "7beedb7c" }
+esp-hal-procmacros = { git = "https://github.com/simpkins/esp-hal.git", rev = "7beedb7c" }
