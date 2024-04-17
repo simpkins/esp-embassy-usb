@@ -32,14 +32,16 @@ bytemuck = "1.15.0"
 static_assertions = "1.1.0"
 defmt = { version = "0.3.6", optional = true }
 
-# TODO: remove these patches once the changes are merged upstream
+# TODO: remove these patches once the upstream changes are published in
+# released crates
 [patch.crates-io]
 # Use the latest embassy code, needed so it depends on the lastest usbd-hid
-embassy-usb-driver = { git = "https://github.com/embassy-rs/embassy.git", rev = "067e4228" }
-embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", rev = "067e4228"  }
-# Use usbd-hid with https://github.com/twitchyliquid64/usbd-hid/pull/63
-usbd-hid-macros = { git = "https://github.com/simpkins/usbd-hid-rs.git", rev = "593e825" }
-usbd-hid = { git = "https://github.com/simpkins/usbd-hid-rs.git", rev = "593e825" }
+embassy-usb-driver = { git = "https://github.com/embassy-rs/embassy.git", rev = "c575c7dc6" }
+embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", rev = "c575c7dc6"  }
+# We require a currently unpublished version of usbd-hid for compatibility
+# with esp-hal dependencies
+usbd-hid-macros = { git = "https://github.com/twitchyliquid64/usbd-hid.git", rev = "76bea16" }
+usbd-hid = { git = "https://github.com/twitchyliquid64/usbd-hid.git", rev = "76bea16" }
 # We require a fairly recent version of esp-hal, which includes some of my USB
 # improvements.
 esp-hal = { git = "https://github.com/esp-rs/esp-hal.git", rev = "3d9f117b" }
