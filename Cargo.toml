@@ -40,7 +40,7 @@ embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", rev = "067e42
 # Use usbd-hid with https://github.com/twitchyliquid64/usbd-hid/pull/63
 usbd-hid-macros = { git = "https://github.com/simpkins/usbd-hid-rs.git", rev = "593e825" }
 usbd-hid = { git = "https://github.com/simpkins/usbd-hid-rs.git", rev = "593e825" }
-# Use a version of esp-hal that depends includes the esp-pacs change
-# https://github.com/esp-rs/esp-pacs/pull/213
-esp-hal = { git = "https://github.com/esp-rs/esp-hal.git", rev = "17492f6b" }
-esp-hal-procmacros = { git = "https://github.com/esp-rs/esp-hal.git", rev = "17492f6b" }
+# We require a fairly recent version of esp-hal, which includes some of my USB
+# improvements.
+esp-hal = { git = "https://github.com/esp-rs/esp-hal.git", rev = "3d9f117b" }
+esp-hal-procmacros = { git = "https://github.com/esp-rs/esp-hal.git", rev = "3d9f117b" }
