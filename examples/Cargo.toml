@@ -8,15 +8,12 @@ rust-version = "1.71"
 
 [[bin]]
 name = "hid_keyboard"
-target = "hid_keyboard.rs"
 
 [[bin]]
 name = "serial"
-target = "serial.rs"
 
 [lib]
 name = "example_utils"
-src = "src/lib.rs"
 
 [dependencies]
 esp-backtrace = { version = "0.11.0", features = [

@@ -13,23 +13,17 @@ use esp_hal::gpio;
 use esp_hal::timer::TimerGroup;
 use esp_hal::{clock::ClockControl, peripherals::Peripherals, prelude::*};
 use esp_hal_procmacros::main;
-use example_utils::TimestampLogger;
+use example_utils::{init_logging, init_serial};
 use usbd_hid::descriptor::{KeyboardReport, SerializedDescriptor};
 
 #[main]
 async fn main(_spawner: Spawner) {
-    // esp_println::logger::init_logger(log::LevelFilter::Trace);
-    unsafe {
-        log::set_logger_racy(&TimestampLogger).unwrap();
-        log::set_max_level_racy(log::LevelFilter::Trace);
-    }
-
+    init_logging(log::LevelFilter::Debug);
     log::info!("Starting HID keyboard example...");
 
     let peripherals = Peripherals::take();
     let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::max(system.clock_control).freeze();
-
     let timg0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
     esp_hal::embassy::init(&clocks, timg0);
 
@@ -40,8 +34,7 @@ async fn main(_spawner: Spawner) {
     );
 
     let config = UsbConfig::bus_powered();
-    log::info!("creating usb driver");
-    let mut state = UsbState::new(
+    let mut usb_state = UsbState::new(
         peripherals.USB0,
         peripherals.USB_WRAP,
         &peripherals.LPWR,
@@ -56,7 +49,12 @@ async fn main(_spawner: Spawner) {
     let mut config = embassy_usb::Config::new(0x6666, 0x6666);
     config.manufacturer = Some("Embassy");
     config.product = Some("HID Keyboard Example");
-    config.serial_number = Some("12345678");
+    let serial = init_serial();
+    config.serial_number = Some(core::str::from_utf8(&serial).unwrap());
+
+    let request_handler = MyRequestHandler {};
+    let mut device_handler = MyDeviceHandler::new();
+    let mut hid_state = HidState::new();
 
     // Create embassy-usb DeviceBuilder using the driver and config.
     // It needs some buffers for building the descriptors.
@@ -65,14 +63,8 @@ async fn main(_spawner: Spawner) {
     // You can also add a Microsoft OS descriptor.
     let mut msos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
-
-    let request_handler = MyRequestHandler {};
-    let mut device_handler = MyDeviceHandler::new();
-
-    let mut hid_state = HidState::new();
-
     let mut builder = Builder::new(
-        state.driver(),
+        usb_state.driver(),
         config,
         &mut config_descriptor,
         &mut bos_descriptor,
@@ -82,21 +74,17 @@ async fn main(_spawner: Spawner) {
 
     builder.handler(&mut device_handler);
 
-    // Create classes on the builder.
+    // Initialize the HID class
     let config = embassy_usb::class::hid::Config {
         report_descriptor: KeyboardReport::desc(),
         request_handler: Some(&request_handler),
         poll_ms: 60,
         max_packet_size: 8,
     };
-
     let hid = HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut hid_state, config);
 
     // Build the builder.
     let mut usb = builder.build();
-
-    // Run the USB device.
-    let usb_fut = usb.run();
 
     let (reader, mut writer) = hid.split();
 
@@ -142,6 +130,7 @@ async fn main(_spawner: Spawner) {
     };
 
     // Run everything concurrently.
+    let usb_fut = usb.run();
     embassy_futures::select::select3(usb_fut, in_fut, out_fut).await;
 }
 
@@ -160,6 +149,8 @@ impl RequestHandler for MyRequestHandler {
 
     fn set_idle_ms(&self, id: Option<ReportId>, dur: u32) {
         log::info!("Set idle rate for {:?} to {:?}", id, dur);
+        // Note: a real keyboard example should honor the idle rate,
+        // and resend this report at the specified idle frequency, even when there is no activity.
     }
 
     fn get_idle_ms(&self, id: Option<ReportId>) -> Option<u32> {

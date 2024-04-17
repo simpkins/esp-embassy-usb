@@ -10,22 +10,17 @@ use esp_backtrace as _;
 use esp_embassy_usb::{Config as UsbConfig, Driver, State as UsbState};
 use esp_hal::prelude::*;
 use esp_hal::{clock::ClockControl, gpio::IO, peripherals::Peripherals, timer::TimerGroup};
-use example_utils::TimestampLogger;
+use example_utils::{init_logging, init_serial};
 use log::info;
 
 #[main]
 async fn main(_spawner: Spawner) {
-    unsafe {
-        log::set_logger_racy(&TimestampLogger).unwrap();
-        log::set_max_level_racy(log::LevelFilter::Trace);
-    }
-
+    init_logging(log::LevelFilter::Trace);
     info!("Starting USB serial example...");
 
     let peripherals = Peripherals::take();
     let system = peripherals.SYSTEM.split();
     let clocks = ClockControl::max(system.clock_control).freeze();
-
     let timg0 = TimerGroup::new_async(peripherals.TIMG0, &clocks);
     esp_hal::embassy::init(&clocks, timg0);
 
@@ -36,7 +31,6 @@ async fn main(_spawner: Spawner) {
     );
 
     let config = UsbConfig::bus_powered();
-    info!("creating usb driver");
     let mut usb_state = UsbState::new(
         peripherals.USB0,
         peripherals.USB_WRAP,
@@ -49,16 +43,16 @@ async fn main(_spawner: Spawner) {
     let mut config = embassy_usb::Config::new(0x6666, 0x6667);
     config.manufacturer = Some("Embassy");
     config.product = Some("USB Serial Example");
-    config.serial_number = Some("12345678"); // TODO: compute from Efuse::get_mac_address();
+    let serial = init_serial();
+    config.serial_number = Some(core::str::from_utf8(&serial).unwrap());
+
+    let mut cdc_acm_state = CdcAcmState::new();
 
     // Create embassy-usb DeviceBuilder using the driver and config.
     // It needs some buffers for building the descriptors.
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
-
-    let mut cdc_acm_state = CdcAcmState::new();
-
     let mut builder = Builder::new(
         usb_state.driver(),
         config,
@@ -68,7 +62,7 @@ async fn main(_spawner: Spawner) {
         &mut control_buf,
     );
 
-    // Create classes on the builder.
+    // Initialize the CDC-ACM class
     let mut class = CdcAcmClass::new(&mut builder, &mut cdc_acm_state, 64);
 
     // Build the builder.
